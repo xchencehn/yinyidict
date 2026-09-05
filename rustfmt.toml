@@ -1,0 +1,5 @@
+# 贴着这份代码本来的排版走，而不是反过来让代码迁就默认值。
+# 它写得比默认密：结构体字面量、let-else、短函数体都尽量留在一行。
+max_width = 100
+use_small_heuristics = "Max"
+single_line_let_else_max_width = 100

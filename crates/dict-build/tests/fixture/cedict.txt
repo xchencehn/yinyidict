@@ -1,0 +1,12 @@
+# CC-CEDICT
+# 这是给测试用的假词库，不是真的 CC-CEDICT。
+#
+測試 测试 [ce4 shi4] /to test/test/testing/
+測試員 测试员 [ce4 shi4 yuan2] /tester/
+銀行 银行 [yin2 hang2] /bank/CL:家[jia1]/
+將就 将就 [jiang1 jiu5] /(coll.) to put up with/to make do/
+編譯器 编译器 [bian1 yi4 qi4] /compiler (computing)/
+花 花 [hua1] /flower/blossom/to spend (money, time)/(coll.) lecherous/
+裡 里 [li3] /variant of 裏|里[li3]/inside/
+着 着 [zhe5] /aspect particle indicating action in progress/
+中國 中国 [Zhong1 guo2] /China/

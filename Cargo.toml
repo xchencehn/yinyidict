@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/dict-core", "crates/dict-build", "crates/dict-app", "crates/dict-tts"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde     = { version = "1", features = ["derive"] }
+bincode   = "1.3"
+fst       = "0.4"
+memmap2   = "0.9"
+anyhow    = "1"
+
+# `chunks_exact(4)` 读起来比 `as_chunks::<4>()` 直白，而且这里全是
+# 「四个字节一个 u32」「四个字节一个像素」这种一眼能懂的场景 ——
+# 为了迎合一条新 lint 去换写法只是噪音。
+[workspace.lints.clippy]
+chunks_exact_to_as_chunks = "allow"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+codegen-units = 1

@@ -1,0 +1,7 @@
+# 仓库里一律存 LF，检出时不转换 —— 这个工程的构建脚本是 bash，
+# CRLF 会让它们在 Git Bash / CI 里直接报错。
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bmp binary
+*.db binary
+*.ico binary

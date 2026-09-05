@@ -1,0 +1,19 @@
+[package]
+name = "dict-build"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dict-core = { path = "../dict-core" }
+anyhow.workspace = true
+
+[[bin]]
+name = "dict-build"
+path = "src/main.rs"
+
+[[bin]]
+name = "dict-query"
+path = "src/bin/query.rs"
+
+[lints]
+workspace = true

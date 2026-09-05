@@ -1,0 +1,32 @@
+# 由 tools/setup-toolchain.sh 生成 → .cargo/config.toml（不进版本库）。
+# 里面必须是绝对路径，所以只能生成：cargo 的 rustflags 不做变量展开，
+# 而 rustc 查 dlltool 是走 PATH 的，config 里也没法往 PATH 前面插目录。
+#
+# 这一整份只在**没有 MSVC** 的机器上需要。有 MSVC 的直接 cargo build，
+# 什么都不用配 —— 下面这些坑都是 windows-gnu 这条路上独有的：
+#
+# 1. rustup 自带的那份 mingw 是「仅用于链接」的精简版（见它自己的
+#    GCC-WARNING.txt）：没有 as.exe，导入库只有 44 个，缺 shlwapi
+#    （eframe 依赖链要用）。所以 linker 指向 .bin/mingw64 下完整的
+#    MinGW-w64（winlibs，msvcrt 变体，与 Rust windows-gnu 目标匹配；
+#    便携解压，不需要管理员权限），并关掉 self-contained，让 CRT 对象和
+#    libgcc 全部由这一份提供，不和 rustup 那份混用。
+#
+# 2. raw-dylib（windows-sys / eframe 依赖链要用）需要 dlltool。GNU dlltool
+#    还要一个外部汇编器，而 llvm-ar 以 llvm-dlltool 的名字调用时是自包含的。
+#
+# 3. **最关键的一条**：GNU ld 给 eframe 这种体量的映像链出来的二进制是坏的 ——
+#    启动时 __do_global_ctors → __gcc_register_frame 会跳到野地址，
+#    0xC0000005，崩在 main 之前，且与 gc-sections / ASLR / panic 策略 /
+#    静态还是共享 libgcc 都无关。换成 LLD 就正常。
+#    （单独链接 egui 或单独链接 winit 都不会触发，合起来才会。）
+#    setup-toolchain.sh 会把 rust-lld 改名成 ld.lld 放进 mingw 的
+#    x86_64-w64-mingw32/bin/ —— 那个目录本来就在 gcc 找辅助程序的搜索路径上，
+#    所以这里不需要再写 -B。
+[target.x86_64-pc-windows-gnu]
+linker = "@ROOT@/.bin/mingw64/bin/gcc.exe"
+rustflags = [
+  "-Cdlltool=@ROOT@/.bin/llvm-dlltool.exe",
+  "-Clink-self-contained=no",
+  "-Clink-arg=-fuse-ld=lld",
+]

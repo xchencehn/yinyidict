@@ -1,0 +1,11 @@
+[package]
+name = "dict-tts"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dict-core = { path = "../dict-core" }
+anyhow.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+# Unihan_Variants.txt
+# 测试用，不是真的 Unihan。
+U+88CF	kSimplifiedVariant	U+91CC
+U+91CC	kTraditionalVariant	U+88CF
+U+8457	kSemanticVariant	U+7740

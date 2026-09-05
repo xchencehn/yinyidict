@@ -1,0 +1,25 @@
+[package]
+name = "dict-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dict"
+path = "src/main.rs"
+
+[dependencies]
+dict-core = { path = "../dict-core" }
+dict-tts  = { path = "../dict-tts" }
+anyhow.workspace = true
+# 默认 feature 会拉进 wgpu + accesskit（dxgi / propsys / uiautomationcore）。
+# 这个词典只画文字，OpenGL 后端足够，依赖面也小得多。
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+egui   = "0.36"
+serde.workspace = true
+# 设置文件用；纯 Rust，无 C 依赖
+serde_json = "1"
+# 拿 eframe 窗口的 HWND 用来挂任务栏图标；版本必须和 eframe 依赖的一致
+raw-window-handle = "0.6.2"
+
+[lints]
+workspace = true

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # windows-latest 自带 MSVC，正好替我们跑一遍 msvc 这条路 ——
+  # 开发机上没有 MSVC，本地只跑得了 windows-gnu，这条路只有 CI 验得了。
+  test:
+    name: 测试 (${{ matrix.toolchain }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy,rustfmt
+          rustup default ${{ matrix.toolchain }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 不下真实词库：1.2 GB，CI 上不现实。ETL 用 crates/dict-build/tests/fixture
+      # 里那份编出来的微型词库跑通，见 tests/etl.rs。
+      - name: 编译
+        run: cargo build --workspace --all-targets
+
+      - name: 测试
+        run: cargo test --workspace
+
+  lint:
+    name: clippy + fmt
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装工具链
+        run: rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # 发布版能不能真的链出来，和调试版不是一回事 —— GNU ld 那个
+  # 「崩在 main 之前」的坑就只在 release 的体量上才发作。
+  release-build:
+    name: release 构建
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dict-windows-x86_64
+          path: target/release/dict.exe
+          if-no-files-found: error

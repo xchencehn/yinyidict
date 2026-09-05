@@ -1,0 +1,20 @@
+/target
+/data/raw
+/data/index
+/vendor
+/models
+/shots
+# 工具链变通用的本地副本，不进版本库；用 tools/ 下的说明重建
+/.bin
+*.tar.bz2
+*.zip
+*.gz
+/voices
+/.cargo/config.toml
+# 自截图产出（DICT_SHOT），不进版本库
+*.bmp
+# 本机的界面设置，各人不同
+/settings.json
+# LLM 重组的中间产物与日志。它们是 CC-CEDICT 的派生物（CC BY-SA），
+# 真要分发得单独按 BY-SA 放出，不混在 MIT 的代码里。
+/data
