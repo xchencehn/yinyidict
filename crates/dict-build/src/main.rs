@@ -8,6 +8,7 @@
 mod cedict;
 mod corpus;
 mod english;
+mod fetch;
 mod llm;
 mod sqlite;
 
@@ -169,6 +170,11 @@ fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("llm") {
         return llm::main(&argv[1..]);
+    }
+    // `dict-build fetch` 把数据源拉下来解开。发布包里的用户没有 bash，
+    // 这一步得由程序自己做，见 fetch 模块。
+    if argv.first().map(String::as_str) == Some("fetch") {
+        return fetch::main(&argv[1..]);
     }
 
     let args = parse_args();

@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 dict-core = { path = "../dict-core" }
 anyhow.workspace = true
+flate2 = "1.1.10"
+bzip2-rs = "0.1.2"
 
 [[bin]]
 name = "dict-build"

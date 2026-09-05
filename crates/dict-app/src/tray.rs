@@ -181,6 +181,7 @@ extern "system" {
     fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
     fn IsWindowVisible(h: Hwnd) -> i32;
     fn IsIconic(h: Hwnd) -> i32;
+    fn MessageBoxW(h: Hwnd, text: *const u16, cap: *const u16, ty: u32) -> i32;
     fn CreateIconIndirect(info: *const IconInfo) -> Hicon;
     fn LoadImageW(
         inst: Hinstance,
@@ -808,6 +809,17 @@ pub(crate) unsafe fn make_hicon(size: u32) -> Hicon {
 const WM_SETICON: u32 = 0x0080;
 const ICON_SMALL: usize = 0;
 const ICON_BIG: usize = 1;
+
+/// 弹一个系统对话框。
+///
+/// 这是个 GUI 子系统的程序，**没有控制台**：启动失败时 `eprintln!` 谁也看不见，
+/// 双击之后就是「什么都没发生」。第一次运行还没准备词库的人，见到的正是这一幕。
+pub fn alert(title: &str, text: &str) {
+    // SAFETY: 两个字符串都以 NUL 结尾，MB_OK | MB_ICONWARNING。
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide(title).as_ptr(), 0x0000_0030);
+    }
+}
 
 /// 给主窗口挂上标题栏和任务栏图标。
 ///

@@ -109,13 +109,15 @@ pub fn decide_close(quitting: bool, close_to_tray: bool, has_tray: bool) -> Clos
     }
 }
 
-/// 主窗口和设置窗口用同一个尺寸。
+/// 窗口的出厂尺寸。窄而高 —— 词条是竖着长的，宽了只是浪费。
 ///
-/// 设置是主窗口的子视口，两个不一样大的话来回切会跳一下；而且查词是瞥一眼
-/// 就走的动作，窗口不该占掉半个屏。
-pub const WINDOW_SIZE: [f32; 2] = [574.0, 480.0];
+/// 真正用的是 `settings.json` 里记着的那个，这里只是没记录时的起点。
+/// 设置子窗口用同一个尺寸：它是主窗口的子视口，两个不一样大的话来回切会跳。
+pub const WINDOW_DEFAULT: [f32; 2] = [458.0, 632.0];
 /// 再小就排不下词条页的两栏了。
 pub const WINDOW_MIN: [f32; 2] = [400.0, 320.0];
+/// 自绘标题栏的高度。
+pub const TITLE_H: f32 = 34.0;
 
 /// 开机就该做、但不该和开窗口抢资源的杂活。见 [`App::start_deferred`]。
 pub struct Deferred {
@@ -292,11 +294,15 @@ impl App {
     /// 时间里 —— 总耗时没变，但等待没了。
     ///
     /// `start_hidden` 时不必等：本来就没有窗口要给人看。
-    fn start_deferred(&mut self) {
+    fn start_deferred(&mut self, ctx: &egui::Context) {
         if !self.painted && self.visible {
             return;
         }
         let Some(d) = self.deferred.take() else { return };
+        // 上次退出时钉着的话，这次也钉上
+        if self.cfg.pinned {
+            self.push_pin(ctx);
+        }
         // 语音先起：它是里面最慢的，而用户点播放键的时刻最早也在几秒之后
         self.speech = d.tts.map(dict_tts::Tts::start);
         crate::warm_index(&d.index);
@@ -609,6 +615,214 @@ impl App {
         }
 
         resp.on_hover_text(tip).clicked()
+    }
+
+    /// 自绘标题栏。
+    ///
+    /// 为什么不用系统的：一是那条灰边在这套「无卡片无边框」的配色里格格不入；
+    /// 二是**原生标题栏加不了按钮** —— 想要一颗「钉在最前」的钉子，只能自己画。
+    ///
+    /// 代价是拖动、双击最大化、八个方向的缩放都得自己接回来，见 `frame_drag`。
+    /// 好在 winit 底下走的还是 `WM_NCLBUTTONDOWN`，贴边分屏这些照常有。
+    fn title_bar(&mut self, ui: &mut egui::Ui, rect: Rect, main: bool) {
+        let p = self.palette;
+        let ctx = ui.ctx().clone();
+        ui.painter().rect_filled(rect, 0.0, p.ground);
+        // 一条极淡的分隔线，只为把标题栏和内容分开，不做边框
+        ui.painter().hline(rect.x_range(), rect.max.y - 0.5, egui::Stroke::new(1.0, p.rule));
+
+        let title = if main { "词典" } else { "设置" };
+        ui.painter().text(
+            rect.left_center() + Vec2::new(14.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            title,
+            fonts::sans(12.5),
+            p.faint,
+        );
+
+        // 按钮从右往左排
+        const BW: f32 = 40.0;
+        let mut x = rect.max.x;
+        let mut slot = |n: usize| {
+            let r =
+                Rect::from_min_max(Pos2::new(x - BW, rect.min.y), Pos2::new(x, rect.max.y - 1.0));
+            x -= BW;
+            let _ = n;
+            r
+        };
+
+        let close_r = slot(0);
+        let (max_r, min_r, pin_r) = if main {
+            (slot(1), slot(2), slot(3))
+        } else {
+            // 设置窗口只留关闭：最大化没意义，最小化会把父窗口一起带走
+            (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING)
+        };
+
+        // ── 关闭 ──
+        if self.title_btn(ui, close_r, Glyph::Close, false) {
+            if main {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.settings_open = false;
+                self.save_settings();
+            }
+        }
+        if !main {
+            self.frame_drag(ui, rect, x);
+            return;
+        }
+
+        // ── 最大化 / 还原 ──
+        let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if self.title_btn(ui, max_r, Glyph::Max { restore: maxed }, false) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
+        }
+
+        // ── 最小化 ──
+        if self.title_btn(ui, min_r, Glyph::Min, false) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
+        // ── 钉在最前 ──
+        if self.title_btn(ui, pin_r, Glyph::Pin, self.cfg.pinned) {
+            self.cfg.pinned = !self.cfg.pinned;
+            self.cfg_dirty = true;
+            self.push_pin(&ctx);
+        }
+
+        self.frame_drag(ui, rect, x);
+    }
+
+    /// 标题栏上的一个按钮。`on` = 处于按下状态（只有钉子会用到）。
+    fn title_btn(&self, ui: &mut egui::Ui, r: Rect, g: Glyph, on: bool) -> bool {
+        if r == Rect::NOTHING {
+            return false;
+        }
+        let p = self.palette;
+        let resp = ui.interact(r, ui.id().with(("titlebtn", g.id())), egui::Sense::click());
+        let hot = resp.hovered();
+        if hot {
+            // 关闭键的悬停底色单独给红，别的都用中性色 —— 这是全世界的习惯，
+            // 手指还没落下去就该知道自己指的是哪个
+            let bg = if matches!(g, Glyph::Close) { p.tone[1] } else { p.hit };
+            ui.painter().rect_filled(r, 0.0, bg);
+        }
+        let ink = match (g, hot) {
+            (Glyph::Close, true) => p.ground,
+            _ if on => p.tone[1],
+            (_, true) => p.ink,
+            _ => p.muted,
+        };
+        g.paint(ui.painter(), r.center(), ink, on);
+        resp.clicked()
+    }
+
+    /// 标题栏空白处拖动 + 双击最大化。
+    fn frame_drag(&self, ui: &mut egui::Ui, bar: Rect, buttons_left: f32) {
+        let ctx = ui.ctx().clone();
+        let drag_area = Rect::from_min_max(bar.min, Pos2::new(buttons_left, bar.max.y));
+        let resp = ui.interact(drag_area, ui.id().with("titledrag"), egui::Sense::click_and_drag());
+        if resp.double_clicked() {
+            let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
+        } else if resp.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+    }
+
+    /// 窗口八个方向的缩放边。自绘标题栏把系统那圈边框丢了，得自己接回来。
+    ///
+    /// **必须在内容之后注册**：egui 的命中判定是后来者居上，先注册的话
+    /// 输入框、滚动区会把贴边那几像素的点击全吃掉，边就永远拖不动。
+    fn resize_edges(&self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        // 最大化时没有缩放边可言
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        use egui::{CursorIcon as C, ResizeDirection as D};
+        const E: f32 = 6.0;
+        let w = ui.max_rect();
+        // 先角后边：角落要压在边上面，否则永远拖不到斜角
+        let corners = [
+            (Rect::from_min_size(w.min, Vec2::splat(E)), D::NorthWest, C::ResizeNwSe),
+            (
+                Rect::from_min_size(Pos2::new(w.max.x - E, w.min.y), Vec2::splat(E)),
+                D::NorthEast,
+                C::ResizeNeSw,
+            ),
+            (
+                Rect::from_min_size(Pos2::new(w.min.x, w.max.y - E), Vec2::splat(E)),
+                D::SouthWest,
+                C::ResizeNeSw,
+            ),
+            (
+                Rect::from_min_size(w.max - Vec2::splat(E), Vec2::splat(E)),
+                D::SouthEast,
+                C::ResizeNwSe,
+            ),
+        ];
+        let edges = [
+            (
+                Rect::from_min_max(w.min, Pos2::new(w.max.x, w.min.y + E)),
+                D::North,
+                C::ResizeVertical,
+            ),
+            (
+                Rect::from_min_max(Pos2::new(w.min.x, w.max.y - E), w.max),
+                D::South,
+                C::ResizeVertical,
+            ),
+            (
+                Rect::from_min_max(w.min, Pos2::new(w.min.x + E, w.max.y)),
+                D::West,
+                C::ResizeHorizontal,
+            ),
+            (
+                Rect::from_min_max(Pos2::new(w.max.x - E, w.min.y), w.max),
+                D::East,
+                C::ResizeHorizontal,
+            ),
+        ];
+        for (i, (r, dir, cur)) in corners.iter().chain(edges.iter()).enumerate() {
+            let resp = ui.interact(*r, ui.id().with(("resize", i)), egui::Sense::drag());
+            if resp.hovered() || resp.dragged() {
+                ctx.set_cursor_icon(*cur);
+            }
+            if resp.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(*dir));
+            }
+        }
+    }
+
+    /// 窗口被拖动改过大小就记下来，下次启动照这个开。
+    ///
+    /// 最大化时不记 —— 记了的话点「还原」会还原成全屏尺寸，等于还原不回去。
+    /// 只在差出一个点以上时才落盘，免得每帧都把设置标成脏的。
+    fn remember_size(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let Some(r) = ctx.input(|i| i.viewport().inner_rect) else { return };
+        let now = [r.width(), r.height()];
+        if now[0] < WINDOW_MIN[0] || now[1] < WINDOW_MIN[1] {
+            return; // 最小化的那一瞬间会报出 0×0
+        }
+        if (now[0] - self.cfg.window[0]).abs() > 1.0 || (now[1] - self.cfg.window[1]).abs() > 1.0 {
+            self.cfg.window = now;
+            self.cfg_dirty = true;
+        }
+    }
+
+    /// 把「钉在最前」同步给窗口系统。
+    fn push_pin(&self, ctx: &egui::Context) {
+        let level = if self.cfg.pinned {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
     }
 
     // ─────────────────────── 词条页 ───────────────────────
@@ -1098,6 +1312,19 @@ impl App {
             ui.checkbox(&mut hidden, "");
             ui.label(self.text("只驻留托盘，不显示窗口", fonts::sans(13.0), p.ink_soft));
         });
+
+        // 开机自启的状态每帧现读注册表 —— 用户可能从任务管理器的「启动」页
+        // 把它关掉，我们自己记一份的话这里就会显示一个骗人的勾。
+        // 见 autostart 模块开头。
+        let mut auto = crate::autostart::enabled();
+        let was = auto;
+        self.row(ui, "开机自启", |ui| {
+            ui.checkbox(&mut auto, "");
+            ui.label(self.text("登录时自动运行", fonts::sans(13.0), p.ink_soft));
+        });
+        if auto != was && !crate::autostart::set(auto) {
+            self.note = "改不了开机自启（注册表写不进去）".into();
+        }
         if to_tray != self.cfg.close_to_tray || hidden != self.cfg.start_hidden {
             self.cfg.close_to_tray = to_tray;
             self.cfg.start_hidden = hidden;
@@ -1196,16 +1423,28 @@ impl App {
             egui::ViewportId::from_hash_of("settings"),
             egui::ViewportBuilder::default()
                 .with_title("词典 · 设置")
-                .with_inner_size(WINDOW_SIZE)
-                .with_min_inner_size(WINDOW_MIN),
+                .with_inner_size(self.cfg.window)
+                .with_min_inner_size(WINDOW_MIN)
+                .with_decorations(false),
             |ui, class| {
                 let embedded = class == egui::ViewportClass::EmbeddedWindow;
                 if self.settings_focus_pending && !embedded {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.settings_focus_pending = false;
                 }
-                let full = ui.max_rect();
-                ui.painter().rect_filled(full, 0.0, p.ground);
+                let whole = ui.max_rect();
+                ui.painter().rect_filled(whole, 0.0, p.ground);
+                // 内嵌模式（自截图）下子视口画在主窗口里，再画一条标题栏会串味
+                let full = if embedded {
+                    whole
+                } else {
+                    let t = Rect::from_min_max(
+                        whole.min,
+                        Pos2::new(whole.max.x, whole.min.y + TITLE_H),
+                    );
+                    self.title_bar(ui, t, false);
+                    Rect::from_min_max(Pos2::new(whole.min.x, t.max.y), whole.max)
+                };
                 // 右边多留一点给滚动条，免得分隔线顶到它下面
                 let inner = Rect::from_min_max(
                     full.min + Vec2::new(28.0, 0.0),
@@ -1391,7 +1630,7 @@ impl eframe::App for App {
     /// 窗口藏起来时 egui 不出帧，`ui()` 不会被调用 —— 托盘和热键的事件
     /// 只能在这里处理，否则按了热键也叫不出窗口。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.start_deferred();
+        self.start_deferred(ctx);
         // 顺序不能反：托盘的「退出」是靠一条 WM_CLOSE 把界面叫醒的，
         // 得先收到 Quit 把 quitting 立起来，pump_close 才知道这次不是
         // 「关窗口 = 收进托盘」。
@@ -1419,13 +1658,18 @@ impl eframe::App for App {
         }
         self.save_settings();
 
-        let full = ui.max_rect();
+        let whole = ui.max_rect();
 
         // 首帧报一次字体探测结果，字体缺失时好排查
         if !self.font_report.is_empty() {
             println!("字体: {}", self.font_report);
             self.font_report.clear();
         }
+
+        self.remember_size(&ctx);
+        let title = Rect::from_min_max(whole.min, Pos2::new(whole.max.x, whole.min.y + TITLE_H));
+        self.title_bar(ui, title, true);
+        let full = Rect::from_min_max(Pos2::new(whole.min.x, title.max.y), whole.max);
 
         let bar_h = if self.show_bar { BAR_H } else { 0.0 };
         let note_h = if self.note.is_empty() { 0.0 } else { NOTE_H };
@@ -1447,6 +1691,8 @@ impl eframe::App for App {
         }
 
         self.settings_window(&ctx);
+        // 放在最后：见 resize_edges 的说明，早了会被内容吃掉
+        ui.scope_builder(UiBuilder::new().max_rect(whole), |ui| self.resize_edges(ui));
     }
 }
 
@@ -1505,6 +1751,69 @@ fn vk_of(k: egui::Key) -> Option<u32> {
         F12 => 0x7B,
         _ => return None,
     })
+}
+
+/// 标题栏上那四个图标。都是画出来的 —— 字形按钮的大小和基线受字体摆布，
+/// 而这里要的是四个视觉重量一致、能对齐到像素的小记号。
+#[derive(Clone, Copy, PartialEq)]
+enum Glyph {
+    /// 钉在最前。一颗图钉：圆头 + 斜杆。
+    Pin,
+    Min,
+    Max {
+        restore: bool,
+    },
+    Close,
+}
+
+impl Glyph {
+    fn id(self) -> u8 {
+        match self {
+            Glyph::Pin => 0,
+            Glyph::Min => 1,
+            Glyph::Max { .. } => 2,
+            Glyph::Close => 3,
+        }
+    }
+
+    fn paint(self, painter: &egui::Painter, c: Pos2, ink: Color32, on: bool) {
+        let st = egui::Stroke::new(1.2, ink);
+        match self {
+            Glyph::Min => {
+                painter.hline((c.x - 5.0)..=(c.x + 5.0), c.y, st);
+            }
+            Glyph::Max { restore } => {
+                if restore {
+                    // 还原：两个错开的方块，后面那个只露出上和右两条边
+                    let back = Rect::from_min_size(c + Vec2::new(-2.0, -5.0), Vec2::splat(7.0));
+                    painter.line_segment([back.left_top(), back.right_top()], st);
+                    painter.line_segment([back.right_top(), back.right_bottom()], st);
+                    let front = Rect::from_min_size(c + Vec2::new(-5.0, -2.0), Vec2::splat(7.0));
+                    painter.rect_stroke(front, 0.0, st, egui::StrokeKind::Inside);
+                } else {
+                    let r = Rect::from_center_size(c, Vec2::splat(9.0));
+                    painter.rect_stroke(r, 0.0, st, egui::StrokeKind::Inside);
+                }
+            }
+            Glyph::Close => {
+                let d = 4.5;
+                painter.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], st);
+                painter.line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], st);
+            }
+            Glyph::Pin => {
+                // 一颗图钉：横着的帽子 + 往下的针。
+                // 钉住时立起来、帽子填实；没钉住时歪着、帽子只描边 ——
+                // 姿势本身就是状态，不必靠颜色深浅去猜（画圆点会被看成放大镜）。
+                let ang: f32 = if on { 0.0 } else { -0.72 };
+                let (sa, ca) = ang.sin_cos();
+                let at = |x: f32, y: f32| c + Vec2::new(x * ca - y * sa, x * sa + y * ca);
+                let head = vec![at(-4.6, -4.8), at(4.6, -4.8), at(4.6, -1.9), at(-4.6, -1.9)];
+                let fill = if on { ink } else { Color32::TRANSPARENT };
+                painter.add(egui::Shape::convex_polygon(head, fill, st));
+                painter.line_segment([at(0.0, -1.9), at(0.0, 5.4)], st);
+            }
+        }
+    }
 }
 
 fn params_eq(a: &Params, b: &Params) -> bool {

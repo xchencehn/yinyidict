@@ -1,0 +1,73 @@
+name: Release
+
+# 打了 v* 标签就发一版。构建在 CI 上做而不是本机：
+# runner 自带 MSVC，产出的是标准的 msvc 二进制，比开发机上那份
+# windows-gnu 的更适合发给别人。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 版本号（如 v0.1.0）
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 定版本号
+        id: v
+        shell: pwsh
+        run: |
+          $v = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            '${{ github.event.inputs.version }}'
+          } else {
+            '${{ github.ref_name }}'
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: 构建
+        run: cargo build --release --workspace
+
+      - name: 测试
+        run: cargo test --workspace
+
+      - name: 打包
+        shell: pwsh
+        run: ./tools/package.ps1 -Version ${{ steps.v.outputs.version }}
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.v.outputs.version }}
+          name: 词典 ${{ steps.v.outputs.version }}
+          files: dist/*.zip
+          body: |
+            ## 装法
+
+            1. 下下面那个 zip，解到任意目录。
+            2. 双击 `setup.bat`，等它把词典数据和语音模型下好、索引建好
+               （约 850 MB，头一次要几分钟）。
+            3. 双击 `dict.exe`。按 `Alt+1` 随时唤出。
+
+            ## 为什么包这么小、还要跑一次 setup
+
+            词库数据不属于本项目，各有各的授权（CC-CEDICT 是 CC BY-SA、
+            Tatoeba 是 CC BY、ECDICT 授权不明确），不该由我们再分发。
+            所以包里只有程序本身，数据由它自己从各家官方地址取 ——
+            不需要你另外装任何东西，用的是 Windows 自带的 curl 和 tar。
+
+            ## 说明
+
+            - 只支持 Windows x64。
+            - 没有代码签名，SmartScreen 会拦一下：更多信息 → 仍要运行。
+            - 有 NVIDIA 显卡且装了 CUDA + cuDNN 的话发音快 9 倍，否则自动用 CPU。
+            - 快捷方式图标会是白板：图标资源靠 MinGW 的 windres 嵌入，
+              CI 上是 MSVC，没有这个工具。窗口和托盘图标不受影响。

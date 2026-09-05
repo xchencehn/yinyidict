@@ -32,6 +32,11 @@ impl Theme {
 #[serde(default)]
 pub struct Settings {
     pub hotkey: Hotkey,
+    /// 窗口大小（逻辑点，不含标题栏之外的边框）。**每次改动都会记下来** ——
+    /// 不然每次启动都得重新拖一遍。最大化时不记，否则还原不回去。
+    pub window: [f32; 2],
+    /// 钉在最前。
+    pub pinned: bool,
     /// 关窗口时收进托盘而不是退出。
     pub close_to_tray: bool,
     /// 启动时不显示窗口，只驻留托盘 —— 配合开机自启用。
@@ -55,6 +60,8 @@ impl Default for Settings {
         let p = dict_core::Params::default();
         Settings {
             hotkey: Hotkey::default(),
+            window: crate::app::WINDOW_DEFAULT,
+            pinned: false,
             close_to_tray: true,
             start_hidden: false,
             theme: Theme::Auto,
@@ -100,6 +107,16 @@ impl Settings {
         let d = Settings::default();
         if !self.hotkey.is_valid() {
             self.hotkey = d.hotkey;
+        }
+        // 手改文件写了个离谱的尺寸，或者上次退出时窗口正好被拖到极小，
+        // 都不该让下次启动开出一个点不开的窗口
+        let d = crate::app::WINDOW_DEFAULT;
+        let min = crate::app::WINDOW_MIN;
+        for ((cur, def), lo) in self.window.iter_mut().zip(d).zip(min) {
+            if !cur.is_finite() || *cur < lo {
+                *cur = def;
+            }
+            *cur = cur.min(4000.0);
         }
         self.speed = self.speed.clamp(0.5, 2.0);
         self.exact_bonus = self.exact_bonus.clamp(0.0, 24.0);
@@ -159,6 +176,27 @@ mod tests {
         assert_eq!(s.theme, Theme::Auto);
         assert!(s.close_to_tray);
         assert_eq!(s.hotkey, Hotkey::default());
+    }
+
+    #[test]
+    fn an_unusable_window_size_falls_back_to_the_default() {
+        let tiny: Settings = serde_json::from_str(r#"{"window": [10.0, 8.0]}"#).unwrap();
+        assert_eq!(
+            tiny.sanitized().window,
+            crate::app::WINDOW_DEFAULT,
+            "小到点不开的窗口要退回默认"
+        );
+
+        let ok: Settings = serde_json::from_str(r#"{"window": [900.0, 700.0]}"#).unwrap();
+        assert_eq!(ok.sanitized().window, [900.0, 700.0], "正常尺寸要原样留着");
+    }
+
+    #[test]
+    fn the_window_size_survives_a_round_trip() {
+        let s = Settings { window: [458.0, 632.0], pinned: true, ..Default::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.window, [458.0, 632.0]);
+        assert!(back.pinned);
     }
 
     #[test]

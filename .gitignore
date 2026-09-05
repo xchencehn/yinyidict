@@ -18,3 +18,4 @@
 # LLM 重组的中间产物与日志。它们是 CC-CEDICT 的派生物（CC BY-SA），
 # 真要分发得单独按 BY-SA 放出，不混在 MIT 的代码里。
 /data
+/dist

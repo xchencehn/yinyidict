@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autostart;
 mod fonts;
 mod icon;
 mod settings;
@@ -74,9 +75,21 @@ fn pick_backend() -> Option<(PathBuf, String, Vec<PathBuf>)> {
     Some((cpu.clone(), String::from("cpu"), Vec::new()))
 }
 
-fn main() -> Result<()> {
-    let index = find("data/index")
-        .context("找不到 data/index。先跑 `cargo run --release -p dict-build` 生成词库")?;
+fn main() {
+    // 没有控制台，出错必须弹窗，否则双击之后就是「什么都没发生」
+    if let Err(e) = run() {
+        tray::alert("词典启动失败", &format!("{e:#}"));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let index = find("data/index").context(
+        "还没有词库。
+
+         先双击同目录下的 setup.bat，它会下载词典数据并建好索引
+         （约 850 MB，头一次要等几分钟）。",
+    )?;
     let store = Store::open(&index)?;
     println!("词库 {} 条 · {}", store.n, index.display());
 
@@ -111,9 +124,13 @@ fn main() -> Result<()> {
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(app::WINDOW_SIZE)
+            // 尺寸取上次退出时记下的那个
+            .with_inner_size(cfg.window)
             .with_min_inner_size(app::WINDOW_MIN)
             .with_icon(icon::window_icon())
+            // 标题栏自己画：系统那条在这套配色里格格不入，而且要往里塞一颗
+            // 「钉在最前」的钉子 —— 原生标题栏加不了按钮。
+            .with_decorations(false)
             .with_title("词典"),
         ..Default::default()
     };
