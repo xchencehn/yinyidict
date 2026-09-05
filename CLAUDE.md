@@ -646,9 +646,10 @@ Windows，没有 Git Bash、没有 gzip、没有 bunzip2。
 ### 已知的事
 
 - 只支持 Windows x64；没有代码签名，SmartScreen 会拦一下。
-- **CI 出的 exe 不带图标资源**，快捷方式是白板：`build.rs` 靠 MinGW 的
-  `windres` 嵌入 .ico，而 CI 上是 MSVC，没有这个工具。窗口和托盘图标不受影响，
-  那两处是运行期画的。
+- **CI 出的 exe 是带图标的。** 这里一度写着「MSVC 上没有 windres，所以快捷
+  方式是白板」—— 那是没核实就写下的推断，实际不成立：GitHub 的 windows
+  runner 自带 MinGW，`windres` 在 PATH 上。核对方法是比对两个 exe 的 `.rsrc`
+  段（都是 366 KB），再用 `ExtractAssociatedIcon` 取出位图比哈希，逐像素相同。
 
 ---
 
