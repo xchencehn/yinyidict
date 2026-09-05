@@ -1,64 +1,27 @@
 name: Release
 
 # 打了 v* 标签就发一版。构建在 CI 上做而不是本机：
-# runner 自带 MSVC，产出的是标准的 msvc 二进制，比开发机上那份
-# windows-gnu 的更适合发给别人。
+# runner 自带 MSVC，产出的是标准 msvc 二进制，比开发机上那份 windows-gnu 的
+# 更适合发给别人。
 #
-# 出两个包：
-#   slim  约 4 MB，只有程序，词库让用户跑 setup.bat 自己取
-#   full  约 800 MB，词库模型全打进去，解压即用
-# 分成两个 job：完整包要下 400 MB 再建索引，跑砸了不该把精简包一起拖下水。
+# 只出一个资产：**Windows 安装程序**。词库、语音模型、推理运行库全打进去，
+# 装完就能用。CI 会真跑一遍 dict-build fetch 把数据取下来再建索引 ——
+# 顺带每次发版都替我们验一遍那条路还通不通。
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
-        description: 版本号（如 v0.1.0）
+        description: 版本号（如 v0.1.2）
         required: true
 
 permissions:
   contents: write
 
-env:
-  NOTES: |
-    ## 下哪个
-
-    | | 大小 | 说明 |
-    |---|---|---|
-    | `...-slim.zip` | 约 4 MB | 只有程序。解压后双击 `setup.bat`，它自己去各家官方地址取词库和模型（约 850 MB），再建索引 |
-    | `...-full.zip` | 约 800 MB | 词库、语音模型、运行库全在里面，解压双击 `dict.exe` 就能用 |
-
-    网速好、不想等的选 slim；想一次到位的选 full。
-
-    ## 用法
-
-    双击 `dict.exe`。按 `Alt+1` 随时唤出，关窗口是收进托盘，真要退出走托盘菜单。
-    设置里可以开「开机自启」。
-
-    ## 授权
-
-    程序代码 MIT。**完整包里含有第三方词典数据和模型**，各有各的授权，
-    详见包内 `THIRD-PARTY.txt`：
-
-    - CC-CEDICT（中文词条）CC BY-SA 3.0 —— 本包中的索引是其派生数据，同样以 BY-SA 发布
-    - Tatoeba（例句）CC BY 2.0 FR
-    - **ECDICT（英文词条）授权状况不明确**，其数据由多个来源汇编而成，
-      本项目无法核实每一条的可分发性。相关权利人如认为不应分发，请提 issue，会立即移除。
-    - Unihan（Unicode License）、jieba（MIT）、Kokoro 与 sherpa-onnx（Apache 2.0）
-
-    ## 说明
-
-    - 只支持 Windows x64。
-    - 没有代码签名，SmartScreen 会拦一下：更多信息 → 仍要运行。
-    - 有 NVIDIA 显卡且装了 CUDA + cuDNN 的话发音快约 10 倍；没有的话自动用 CPU，照样出声（词头和第一条例句会预热，点了就响）。
-    - 首次启动语音引擎要几秒（模型 311 MB），期间界面照常能查词。
-
 jobs:
-  slim:
+  release:
     runs-on: windows-latest
-    outputs:
-      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -67,12 +30,14 @@ jobs:
         id: v
         shell: pwsh
         run: |
-          $v = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
             '${{ github.event.inputs.version }}'
           } else {
             '${{ github.ref_name }}'
           }
-          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          # Inno 的 AppVersion 不带 v
+          "num=$($tag -replace '^v', '')" >> $env:GITHUB_OUTPUT
 
       - name: 构建
         run: cargo build --release --workspace
@@ -80,42 +45,52 @@ jobs:
       - name: 测试
         run: cargo test --workspace
 
-      - name: 打精简包
-        shell: pwsh
-        run: ./tools/package.ps1 -Version ${{ steps.v.outputs.version }}
-
-      - name: 发布
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.v.outputs.version }}
-          name: 词典 ${{ steps.v.outputs.version }}
-          files: dist/*-slim.zip
-          body: ${{ env.NOTES }}
-
-  full:
-    runs-on: windows-latest
-    needs: slim
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-
-      - name: 构建
-        run: cargo build --release --workspace
-
-      # 走的就是发布包里用户跑的那条路（dict-build fetch），
-      # 顺带每次发版都替我们验一遍它还能不能用
+      # 走的就是开发机上同一条路（不需要 bash，只用 Windows 自带的 curl 和 tar）
       - name: 取数据源
         run: ./target/release/dict-build.exe fetch
 
       - name: 建索引
         run: ./target/release/dict-build.exe
 
-      - name: 打完整包
+      - name: 装 Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: 打安装程序
         shell: pwsh
-        run: ./tools/package.ps1 -Version ${{ needs.slim.outputs.version }} -Full
+        run: ./tools/package.ps1 -Version ${{ steps.v.outputs.num }} -Iss
 
       - name: 发布
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.slim.outputs.version }}
-          files: dist/*-full.zip
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: 词典 ${{ steps.v.outputs.tag }}
+          files: dist/*setup.exe
+          body: |
+            ## 装法
+
+            下下面那个 `setup.exe`，双击，一路下一步。装完桌面和开始菜单都有图标。
+
+            词库、语音模型、推理运行库都在安装包里，**装完直接能用**，不用再下别的。
+            装到 `%LOCALAPPDATA%\Programs\yinyidict`，不需要管理员权限、不弹 UAC。
+
+            按 `Alt+1` 随时唤出；关窗口是收进托盘，真要退出走托盘菜单。
+            设置里能改唤出快捷键、语速、配色、开机自启。
+
+            ## 授权
+
+            程序代码 MIT。**安装包里含有第三方词典数据和模型**，各有各的授权，
+            详见装好之后目录里的 `THIRD-PARTY.txt`：
+
+            - CC-CEDICT（中文词条）CC BY-SA 3.0 —— 本包中的索引是其派生数据，同样以 BY-SA 发布
+            - Tatoeba（例句）CC BY 2.0 FR
+            - **ECDICT（英文词条）授权状况不明确**，其数据由多个来源汇编而成，
+              本项目无法核实每一条的可分发性。相关权利人如认为不应分发，请提 issue，会立即移除。
+            - Unihan（Unicode License）、jieba（MIT）、Kokoro 与 sherpa-onnx（Apache 2.0）
+
+            ## 说明
+
+            - 只支持 Windows x64。
+            - 没有代码签名，SmartScreen 会拦一下：更多信息 → 仍要运行。
+            - 有 NVIDIA 显卡且装了 CUDA + cuDNN 的话发音快约 10 倍；没有的话自动用
+              CPU，照样出声（词头和第一条例句会预热，点了就响）。
+            - 首次启动语音引擎要几秒（模型 311 MB），期间界面照常能查词。

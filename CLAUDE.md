@@ -270,6 +270,19 @@ query 是上一次的延长时**只过滤不重排**。用户眼睛已经锁定�
   与其让这个功能静默死掉，不如换一个。
   注意注册全局热键等于从全系统抢走这个组合，而 Alt+数字有些输入法在用。
   设置窗口不占热键 —— 走托盘菜单进。
+
+  > **踩过的坑：重设快捷键时按键收不到。** 设置页明明写着「重设」，点了也
+  > 进入等待状态，可按下去的键就是没反应。
+  >
+  > 原因是**设置窗口是独立的系统窗口，有自己的输入队列**。捕获逻辑原来只在
+  > 主窗口那一帧里读 `ctx.input()` —— 而你按键时焦点在设置窗口上，那些按键
+  > 压根不进主窗口的队列。子视口不是「画在主窗口里的一块」，它是另一个窗口，
+  > 这一点很容易忘。
+  >
+  > 修法是在设置子窗口的回调里也调一次 `capture_hotkey`（那里的 `ctx.input()`
+  > 解析到的才是子视口的输入）。主窗口那次调用留着，兜住「焦点回到主窗口时
+  > 按下的键」。顺带把 Esc 分了两义：正在等按键时是「算了不改」，否则才是
+  > 「关设置窗」。
 - **关窗口 = 收进托盘**（可关）。真要退出走托盘菜单的「退出」。
 - **开机自启**（设置页里开关）。写的是
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，不用管理员权限。
@@ -611,14 +624,29 @@ pwsh tools/package.ps1 -Version v0.1.0    # 本地打一份看看
 git tag v0.1.0 && git push origin v0.1.0  # 真发布
 ```
 
-### 包里只有程序，没有词库
+### 发的是安装程序，不是 zip
 
-zip **4 MB**：`dict.exe` + `dict-build.exe` + `setup.bat` + `README.txt`。
+`tools/installer.iss`（Inno Setup 6），CI 上 `choco install innosetup` 之后
+用 ISCC 打。**只有一个资产**，词库、语音模型、推理运行库全在里面，装完就能用。
 
-词库数据一概不进包 —— 它们不属于本项目，各有各的授权，尤其 **ECDICT 授权
-不明确**。把 400 MB 来路不清的派生数据挂到公开 Release 上，和「不碰商业词典
-MDX」是同一条线。所以数据由用户跑一次 `setup.bat`，程序自己从各家官方地址取
-（约 850 MB，之后建索引约 40 秒）。
+几个决定：
+
+- **装到 `{localappdata}\Programs\yinyidict`，`PrivilegesRequired=lowest`。**
+  装 Program Files 要管理员权限，为一个词典弹 UAC 不值当；而且程序把
+  `settings.json` 写在自己旁边，装进 Program Files 那个文件根本写不进去。
+- **不问装到哪**（`DisableDirPage`）：这个程序没有「装到别处」的正当理由。
+- **`AppId` 那个 GUID 不能改** —— 升级时靠它认出「是同一个程序」去原地覆盖。
+- 桌面快捷方式默认勾上，开机自启默认不勾（程序设置页里也能开）。
+  两边写的是同一个注册表值（见 `autostart.rs`），不会各说各话。
+- 卸载时**要把自启那条注册表值删掉**，哪怕当初不是安装程序写的 ——
+  留一条指向已删除 exe 的启动项很讨厌。用 `ValueType: none` +
+  `uninsdeletevalue`：安装时不写，卸载时清。
+- `SetupIconFile` 只认 `.ico`，给它 exe 会直接编译失败。图标是 `build.rs`
+  画在 `OUT_DIR` 里的，`package.ps1` 捞出来传给 ISCC —— 仍然不往版本库塞
+  二进制资源。
+
+`Compression=lzma2/normal` 而不是 `max`：里面大头是 311 MB 的模型和 415 MB
+的索引，本来就压不动多少，max 多省的那点体积换不来那么长的打包时间。
 
 ### `dict-build fetch`
 

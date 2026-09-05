@@ -27,12 +27,16 @@
 
 ## 下载
 
-[Releases](https://github.com/xchencehn/yinyidict/releases) 里有打好的包（4 MB）。
-解开、双击 `setup.bat` 等它把数据下好建好索引（约 850 MB，几分钟），
-之后双击 `dict.exe`。按 `Alt+1` 随时唤出。
+[Releases](https://github.com/xchencehn/yinyidict/releases) 里有 Windows 安装程序。
+下 `setup.exe`，双击，一路下一步 —— 桌面和开始菜单都会有图标。
 
-包里只有程序、没有词库：那些数据不属于本项目，各有各的授权（见下），
-不该由我们再分发，所以由程序自己从各家官方地址取。
+词库、语音模型、推理运行库都在安装包里，**装完直接能用**。装到
+`%LOCALAPPDATA%\Programs\yinyidict`，不需要管理员权限、不弹 UAC。
+
+按 `Alt+1` 随时唤出；关窗口是收进托盘，真要退出走托盘菜单。
+
+> 安装包里含有第三方词典数据，各有各的授权（见下），装好之后目录里有
+> `THIRD-PARTY.txt` 列出全部出处。
 
 ## 从源码跑
 

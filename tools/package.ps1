@@ -1,24 +1,22 @@
-﻿# 打发布包。先 cargo build --release --workspace。
+﻿# 把要装的东西收进 dist\payload，给 Inno Setup 打成安装程序。
 #
-#   pwsh tools/package.ps1 [-Version v0.1.0]         精简包，约 4 MB
-#   pwsh tools/package.ps1 [-Version v0.1.0] -Full   完整包，约 800 MB
+#   pwsh tools/package.ps1                        只收文件
+#   pwsh tools/package.ps1 -Version 0.1.2 -Iss    收完顺手打成 setup.exe
 #
-# 精简包只放我们自己的东西（两个 exe + 说明 + 引导脚本），不含词库；
-# 用户跑一次 setup.bat，程序自己从各家官方地址取。
+# 先 cargo build --release --workspace，再 dict-build fetch + dict-build
+# 把词库准备好 —— 发布的是完整包，词库、模型、运行库全在里面。
 #
-# 完整包连词库、语音模型、推理运行库一起打进去，解压即用。
-# **这是在再分发第三方数据**，所以包里必须带 THIRD-PARTY.txt：
+# **这是在再分发第三方数据**，所以 payload 里必须有 THIRD-PARTY.txt：
 # CC-CEDICT 是 CC BY-SA 3.0，署名和 ShareAlike 都是硬要求，不是礼貌。
 param(
-  [string]$Version = 'v0.1.0',
-  [switch]$Full
+  [string]$Version = '0.0.0',
+  [switch]$Iss
 )
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
-$rel = Join-Path $root 'target\release'
-$kind = if ($Full) { 'full' } else { 'slim' }
-$out = Join-Path $root "dist\yinyidict-$Version-windows-x64-$kind"
+$rel = Join-Path $root 'target/release'
+$payload = Join-Path $root 'dist/payload'
 
 foreach ($f in @('dict.exe', 'dict-build.exe')) {
   if (-not (Test-Path (Join-Path $rel $f))) {
@@ -26,43 +24,59 @@ foreach ($f in @('dict.exe', 'dict-build.exe')) {
   }
 }
 
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $out | Out-Null
+if (Test-Path $payload) { Remove-Item $payload -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $payload | Out-Null
 
-Copy-Item (Join-Path $rel 'dict.exe')       $out
-Copy-Item (Join-Path $rel 'dict-build.exe') $out
-Copy-Item (Join-Path $PSScriptRoot 'dist\*') $out
+Copy-Item (Join-Path $rel 'dict.exe')       $payload
+Copy-Item (Join-Path $rel 'dict-build.exe') $payload
+Copy-Item (Join-Path $PSScriptRoot 'dist/README.txt') $payload
+Copy-Item (Join-Path $PSScriptRoot 'THIRD-PARTY.txt') $payload
 
-if ($Full) {
-  # 词库、模型、运行库。缺哪一样都不能算「完整」，所以逐个查而不是静默跳过。
-  $need = @(
-    @{ src = 'data\index'; dst = 'data\index'; what = '词库索引' }
-    @{ src = 'models\kokoro-multi-lang-v1_1'; dst = 'models\kokoro-multi-lang-v1_1'; what = '语音模型' }
-    @{
-      src  = 'vendor\sherpa-onnx-v1.13.7-win-x64-shared-MT-Release'
-      dst  = 'vendor\sherpa-onnx-v1.13.7-win-x64-shared-MT-Release'
-      what = '推理运行库'
-    }
-  )
-  foreach ($n in $need) {
-    $s = Join-Path $root $n.src
-    if (-not (Test-Path $s)) {
-      throw "完整包缺$($n.what)：$s`n先跑 dict-build fetch，再跑 dict-build"
-    }
-    $d = Join-Path $out $n.dst
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $d) | Out-Null
-    Write-Host "  收 $($n.what) …"
-    Copy-Item $s $d -Recurse
+# 词库、模型、运行库。缺哪一样装出来都是残的，所以逐个查而不是静默跳过。
+$need = @(
+  @{ src = 'data/index'; what = '词库索引' }
+  @{ src = 'models/kokoro-multi-lang-v1_1'; what = '语音模型' }
+  @{ src = 'vendor/sherpa-onnx-v1.13.7-win-x64-shared-MT-Release'; what = '推理运行库' }
+)
+foreach ($n in $need) {
+  $s = Join-Path $root $n.src
+  if (-not (Test-Path $s)) {
+    throw "缺$($n.what)：$s`n先跑 dict-build fetch，再跑 dict-build"
   }
-  # 再分发第三方数据就必须带上出处和授权
-  Copy-Item (Join-Path $PSScriptRoot 'THIRD-PARTY.txt') $out
+  $d = Join-Path $payload $n.src
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $d) | Out-Null
+  Write-Host "  收 $($n.what) …"
+  Copy-Item $s $d -Recurse
 }
 
-$zip = "$out.zip"
-if (Test-Path $zip) { Remove-Item $zip -Force }
-Write-Host '  压缩中（完整包要几分钟）…'
-Compress-Archive -Path "$out\*" -DestinationPath $zip -CompressionLevel Optimal
+$mb = (Get-ChildItem $payload -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
+"payload 收好了：$payload  ({0:N0} MB)" -f $mb
 
-$mb = (Get-Item $zip).Length / 1MB
-"打好了：$zip  ({0:N1} MB)" -f $mb
-Get-ChildItem $out | ForEach-Object { "  $($_.Name)" }
+if (-not $Iss) { return }
+
+$iscc = @(
+  "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+  "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) { throw '找不到 ISCC.exe —— 装一下 Inno Setup 6' }
+
+# 安装向导的图标。build.rs 把 .ico 画在 OUT_DIR 里（不往版本库塞二进制资源），
+# 这里捞一份出来给 Inno 用。
+$isccArgs = @("/DAppVersion=$Version", "/DPayload=$payload")
+$ico = Get-ChildItem (Join-Path $root 'target/release/build') -Recurse -Filter 'dict.ico' `
+  -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($ico) {
+  $dst = Join-Path $root 'dist/dict.ico'
+  Copy-Item $ico.FullName $dst -Force
+  $isccArgs += "/DSetupIcon=$dst"
+}
+else {
+  Write-Host '  （没找到 dict.ico，安装向导用 Inno 的默认图标）'
+}
+
+Write-Host '  打安装程序（大头是模型和索引，要几分钟）…'
+& $iscc @isccArgs (Join-Path $PSScriptRoot 'installer.iss')
+if ($LASTEXITCODE -ne 0) { throw "ISCC 失败（$LASTEXITCODE）" }
+
+$setup = Get-ChildItem (Join-Path $root 'dist') -Filter '*setup.exe' | Select-Object -First 1
+"打好了：$($setup.FullName)  ({0:N1} MB)" -f ($setup.Length / 1MB)

@@ -1501,9 +1501,19 @@ impl App {
                     }
                 }
 
-                if ctx.input(|i| i.viewport().close_requested())
-                    || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                {
+                // 重设快捷键时，按键是按在**这个**窗口上的：它是独立的系统
+                // 窗口，有自己的输入队列。在主窗口那一帧去读是读不到的 ——
+                // 「设置里说能重设，实际按了没反应」就是这么来的。
+                self.capture_hotkey(ctx);
+
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    // 正在等按键时，Esc 是「算了不改了」，不是「关窗口」
+                    if self.capturing_hotkey {
+                        self.capturing_hotkey = false;
+                    } else {
+                        close = true;
+                    }
+                } else if ctx.input(|i| i.viewport().close_requested()) {
                     close = true;
                 }
             },
@@ -1655,6 +1665,9 @@ impl eframe::App for App {
             self.drive_screenshots(&ctx);
         }
 
+        // 这里只兜住「焦点回到主窗口时按下的键」。真正常见的路径是在设置
+        // 子窗口里按 —— 那种按键根本不进主窗口的输入队列，得在子窗口那边收，
+        // 见 settings_window 里的同名调用。
         self.capture_hotkey(&ctx);
         // 捕获快捷键时不要让主窗口的导航键逻辑插手
         if !self.capturing_hotkey {
