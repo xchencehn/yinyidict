@@ -3,6 +3,11 @@ name: Release
 # 打了 v* 标签就发一版。构建在 CI 上做而不是本机：
 # runner 自带 MSVC，产出的是标准的 msvc 二进制，比开发机上那份
 # windows-gnu 的更适合发给别人。
+#
+# 出两个包：
+#   slim  约 4 MB，只有程序，词库让用户跑 setup.bat 自己取
+#   full  约 800 MB，词库模型全打进去，解压即用
+# 分成两个 job：完整包要下 400 MB 再建索引，跑砸了不该把精简包一起拖下水。
 on:
   push:
     tags: ['v*']
@@ -15,9 +20,46 @@ on:
 permissions:
   contents: write
 
+env:
+  NOTES: |
+    ## 下哪个
+
+    | | 大小 | 说明 |
+    |---|---|---|
+    | `...-slim.zip` | 约 4 MB | 只有程序。解压后双击 `setup.bat`，它自己去各家官方地址取词库和模型（约 850 MB），再建索引 |
+    | `...-full.zip` | 约 800 MB | 词库、语音模型、运行库全在里面，解压双击 `dict.exe` 就能用 |
+
+    网速好、不想等的选 slim；想一次到位的选 full。
+
+    ## 用法
+
+    双击 `dict.exe`。按 `Alt+1` 随时唤出，关窗口是收进托盘，真要退出走托盘菜单。
+    设置里可以开「开机自启」。
+
+    ## 授权
+
+    程序代码 MIT。**完整包里含有第三方词典数据和模型**，各有各的授权，
+    详见包内 `THIRD-PARTY.txt`：
+
+    - CC-CEDICT（中文词条）CC BY-SA 3.0 —— 本包中的索引是其派生数据，同样以 BY-SA 发布
+    - Tatoeba（例句）CC BY 2.0 FR
+    - **ECDICT（英文词条）授权状况不明确**，其数据由多个来源汇编而成，
+      本项目无法核实每一条的可分发性。相关权利人如认为不应分发，请提 issue，会立即移除。
+    - Unihan（Unicode License）、jieba（MIT）、Kokoro 与 sherpa-onnx（Apache 2.0）
+
+    ## 说明
+
+    - 只支持 Windows x64。
+    - 没有代码签名，SmartScreen 会拦一下：更多信息 → 仍要运行。
+    - 有 NVIDIA 显卡且装了 CUDA + cuDNN 的话发音快 9 倍，否则自动用 CPU。
+    - 快捷方式图标是白板：图标资源靠 MinGW 的 windres 嵌入，CI 上是 MSVC，
+      没有这个工具。窗口和托盘图标不受影响，那两处是运行期画的。
+
 jobs:
-  release:
+  slim:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -39,7 +81,7 @@ jobs:
       - name: 测试
         run: cargo test --workspace
 
-      - name: 打包
+      - name: 打精简包
         shell: pwsh
         run: ./tools/package.ps1 -Version ${{ steps.v.outputs.version }}
 
@@ -48,26 +90,33 @@ jobs:
         with:
           tag_name: ${{ steps.v.outputs.version }}
           name: 词典 ${{ steps.v.outputs.version }}
-          files: dist/*.zip
-          body: |
-            ## 装法
+          files: dist/*-slim.zip
+          body: ${{ env.NOTES }}
 
-            1. 下下面那个 zip，解到任意目录。
-            2. 双击 `setup.bat`，等它把词典数据和语音模型下好、索引建好
-               （约 850 MB，头一次要几分钟）。
-            3. 双击 `dict.exe`。按 `Alt+1` 随时唤出。
+  full:
+    runs-on: windows-latest
+    needs: slim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
 
-            ## 为什么包这么小、还要跑一次 setup
+      - name: 构建
+        run: cargo build --release --workspace
 
-            词库数据不属于本项目，各有各的授权（CC-CEDICT 是 CC BY-SA、
-            Tatoeba 是 CC BY、ECDICT 授权不明确），不该由我们再分发。
-            所以包里只有程序本身，数据由它自己从各家官方地址取 ——
-            不需要你另外装任何东西，用的是 Windows 自带的 curl 和 tar。
+      # 走的就是发布包里用户跑的那条路（dict-build fetch），
+      # 顺带每次发版都替我们验一遍它还能不能用
+      - name: 取数据源
+        run: ./target/release/dict-build.exe fetch
 
-            ## 说明
+      - name: 建索引
+        run: ./target/release/dict-build.exe
 
-            - 只支持 Windows x64。
-            - 没有代码签名，SmartScreen 会拦一下：更多信息 → 仍要运行。
-            - 有 NVIDIA 显卡且装了 CUDA + cuDNN 的话发音快 9 倍，否则自动用 CPU。
-            - 快捷方式图标会是白板：图标资源靠 MinGW 的 windres 嵌入，
-              CI 上是 MSVC，没有这个工具。窗口和托盘图标不受影响。
+      - name: 打完整包
+        shell: pwsh
+        run: ./tools/package.ps1 -Version ${{ needs.slim.outputs.version }} -Full
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.slim.outputs.version }}
+          files: dist/*-full.zip

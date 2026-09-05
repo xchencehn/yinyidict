@@ -410,10 +410,14 @@ impl App {
     }
 
     fn show(&mut self, id: u32, e: Entry) {
-        // 本机 RTF 约 0.35，一个词头要近一秒。开页就先把它算好，
-        // 等用户真去点播放键时就是零等待。
+        // 开页就先把要念的算好，等用户真去点播放键时才是零等待。
+        // 没有独显的机器上 CPU 合成一个词头约 1.4 秒、一句例句约 2.4 秒 ——
+        // 不预热的话点一下就是干等那么久。第一条例句最常被点，也一并热上。
         if let Some(t) = self.speech.as_ref() {
             t.prefetch_word(&e.word, e.is_zh());
+            if let Some(ex) = e.examples.first() {
+                t.prefetch_sentence(&ex.a);
+            }
         }
         self.entry = Some(e);
         self.entry_id = Some(id);
