@@ -58,9 +58,25 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// 当前是不是开机自启。读不到就当没开。
 pub fn enabled() -> bool {
+    enabled_in(SUBKEY, VALUE)
+}
+
+/// 打开或关掉开机自启。返回是否如愿。
+///
+/// 写进去的是**当前这个 exe 的绝对路径**，所以把程序挪了地方之后要重新勾一次
+/// —— 注册表里那条还指着老位置。这也是为什么值名要固定：换了名字，
+/// 老路径那条就成了删不掉的孤儿。
+pub fn set(on: bool) -> bool {
+    set_in(SUBKEY, VALUE, on)
+}
+
+/// 真正干活的读。键和值名做成参数**只为了让测试有地方落脚** ——
+/// 测试要是直接动真正的 Run 键，就会在跑测试期间把用户的开机自启改掉，
+/// 中途 panic 更是直接留下一个坏状态。
+fn enabled_in(subkey: &str, value: &str) -> bool {
     let Some(api) = Advapi::open() else { return false };
-    let key = wide(SUBKEY);
-    let name = wide(VALUE);
+    let key = wide(subkey);
+    let name = wide(value);
     let mut h: Hkey = 0;
     // SAFETY: 打开成功才读，读完必关。
     unsafe {
@@ -81,15 +97,11 @@ pub fn enabled() -> bool {
     }
 }
 
-/// 打开或关掉开机自启。返回是否如愿。
-///
-/// 写进去的是**当前这个 exe 的绝对路径**，所以把程序挪了地方之后要重新勾一次
-/// —— 注册表里那条还指着老位置。这也是为什么值名要固定：换了名字，
-/// 老路径那条就成了删不掉的孤儿。
-pub fn set(on: bool) -> bool {
+/// 真正干活的写。键和值名是参数，理由同 [`enabled_in`]。
+fn set_in(subkey: &str, value: &str, on: bool) -> bool {
     let Some(api) = Advapi::open() else { return false };
-    let key = wide(SUBKEY);
-    let name = wide(VALUE);
+    let key = wide(subkey);
+    let name = wide(value);
     let mut h: Hkey = 0;
     // SAFETY: 打开成功才写，写完必关。
     unsafe {
@@ -112,18 +124,18 @@ pub fn set(on: bool) -> bool {
         } else {
             // 本来就没有也算成功 —— 用户要的是「关掉」这个结果
             let r = (api.delete)(h, name.as_ptr());
-            r == ERROR_SUCCESS || !enabled_locked(&api, h, &name)
+            r == ERROR_SUCCESS || !exists(&api, h, &name)
         };
         (api.close)(h);
         ok
     }
 }
 
-/// 已经持有句柄时的存在性检查，给 `set` 内部用。
+/// 已经持有句柄时的存在性检查，给 `set_in` 内部用。
 ///
 /// # Safety
 /// `h` 必须是一个还没关闭的、以 `KEY_READ` 打开的句柄。
-unsafe fn enabled_locked(api: &Advapi, h: Hkey, name: &[u16]) -> bool {
+unsafe fn exists(api: &Advapi, h: Hkey, name: &[u16]) -> bool {
     let mut len: u32 = 0;
     (api.query)(
         h,
@@ -139,23 +151,35 @@ unsafe fn enabled_locked(api: &Advapi, h: Hkey, name: &[u16]) -> bool {
 mod tests {
     use super::*;
 
-    /// 开关要能来回切，并且切完读回来是对的。
+    /// 测试不碰真正的 Run 键。
     ///
-    /// 这个测试**会真的动注册表**，所以最后必须还原成跑之前的样子。
+    /// `Software` 一定存在且当前用户可写，所以不必额外建键；值名带 selftest
+    /// 后缀，和任何真实配置都撞不上。**直接拿真的 Run 键做测试是不行的** ——
+    /// 那会在跑测试期间把用户的开机自启改掉，中途 panic 还会留下坏状态。
+    const T_KEY: &str = "Software";
+    const T_VAL: &str = "yinyidict-selftest";
+
     #[test]
-    fn toggling_autostart_is_readable_afterwards() {
-        let before = enabled();
+    fn toggling_is_readable_afterwards() {
+        assert!(set_in(T_KEY, T_VAL, true), "写不进去");
+        assert!(enabled_in(T_KEY, T_VAL), "写完读回来应该是有的");
 
-        assert!(set(true), "打开失败");
-        assert!(enabled(), "打开之后读回来应该是开着的");
+        assert!(set_in(T_KEY, T_VAL, false), "删不掉");
+        assert!(!enabled_in(T_KEY, T_VAL), "删完读回来应该是没有的");
 
-        assert!(set(false), "关闭失败");
-        assert!(!enabled(), "关掉之后读回来应该是关着的");
+        // 删一个本来就没有的，也该算成功 —— 用户要的是「关掉」这个结果
+        assert!(set_in(T_KEY, T_VAL, false), "重复关闭应该幂等");
+    }
 
-        // 关掉一个本来就没有的，也该算成功
-        assert!(set(false), "重复关闭应该是幂等的");
+    /// 没设过的值名读出来必须是 false，不能因为键打得开就说「开着」。
+    #[test]
+    fn an_unset_value_reads_as_off() {
+        assert!(!enabled_in(T_KEY, "yinyidict-selftest-never-written"));
+    }
 
-        set(before);
-        assert_eq!(enabled(), before, "测试完要还原成原样");
+    /// 键不存在时不能崩，也不能说自己开着。
+    #[test]
+    fn a_missing_key_is_not_an_error() {
+        assert!(!enabled_in(r"Software\yinyidict-no-such-key", T_VAL));
     }
 }
