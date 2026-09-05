@@ -1,12 +1,10 @@
 //! 本地 TTS：sherpa-onnx（dlopen 预编译 DLL）+ winmm 播放。
 //!
-//! **机械味有两个不同来源，解法不同：**
-//! - 模型太老（共振峰/拼接合成）→ 换模型。
-//! - 更隐蔽的一种：神经 TTS 喂单个词。韵律模型在无上下文短文本上会退化成平调，
-//!   这跟模型好坏无关。解法是**载体句合成再裁剪** —— 不要合成「将就」，
-//!   合成「这个词读作，将就」，再按最后一处停顿把目标段切出来。见 [`audio`]。
+//! **词头要包进一句话里念**，见 [`carrier`] —— 神经 TTS 喂单个词时韵律会
+//! 退化成平调，这跟模型好坏无关，Kokoro 也一样。整句都念出来，不做裁剪。
 //!
-//! 合成在独立线程上跑，界面不会因为它卡帧。
+//! 合成在独立线程上跑，界面不会因为它卡帧。合成结果带缓存，打开词条页时会
+//! 预热 —— 没有独显的机器上 CPU 合成一次以百毫秒到秒计，不预热就得干等。
 
 pub mod audio;
 pub mod discover;
@@ -28,28 +26,10 @@ pub struct Config {
     /// `"cpu"` 或 `"cuda"`。CUDA 需要另配 onnxruntime 的 CUDA provider。
     pub provider: String,
     pub num_threads: i32,
-    pub speed: f32,
-    /// 是否用载体句合成再裁剪。关掉就是直接喂单词 —— 留着做 A/B。
-    pub carrier: bool,
     /// 额外加进 DLL 搜索路径的目录。CUDA 后端要用 ——
     /// `onnxruntime_providers_cuda.dll` 会去找 cudnn64_9 / cublas64_13 等等，
     /// 它们分散在 cuDNN 和 CUDA Toolkit 各自的 bin 下。
     pub dll_dirs: Vec<PathBuf>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            lib_dir: PathBuf::new(),
-            model_dir: PathBuf::new(),
-            provider: "cpu".into(),
-            // 构建期是批处理，跑多久无所谓；真正有实时要求的只有点击播放这一下。
-            num_threads: 4,
-            speed: 1.0,
-            carrier: true,
-            dll_dirs: Vec::new(),
-        }
-    }
 }
 
 /// 中文和英文都用这一个音色，不给选。
@@ -81,34 +61,37 @@ pub struct Bench {
 }
 
 enum Msg {
-    Word {
-        text: String,
-        zh: bool,
-    },
-    Sentence {
+    /// 念出来。
+    Play {
         text: String,
     },
-    /// 只合成进缓存、不播放。打开词条页时先跑一遍，用户点播放时就是零等待。
-    Prefetch {
+    /// 只合成进缓存、不播放。打开词条页时先跑一遍，点播放时就是零等待。
+    Warm {
         text: String,
-        zh: bool,
-    },
-    /// 例句的预热。和词头分开排队，见 worker 里的说明。
-    PrefetchSentence {
-        text: String,
-    },
-    /// 运行期改语速 / 载体句开关，设置页要靠它，不能要求重启。
-    Tune {
-        speed: f32,
-        carrier: bool,
     },
     /// 只合成不播放，把耗时送回去。
     Bench {
         text: String,
-        zh: bool,
         reply: Sender<Option<Bench>>,
     },
     Stop,
+}
+
+/// 把一个词头包成一句话。
+///
+/// 神经 TTS 在无上下文的短文本上韵律会退化成平调 —— 念「将就」两个字，
+/// 出来的是两个等长等高的音节。包进一句话里，韵律模型才有东西可依据。
+///
+/// **整句都念出来，不裁剪。** 早先的版本会按最后一处停顿把词切下来只播那一段，
+/// 听下来不如整句自然，而且裁剪本身还会引入边界瑕疵。
+///
+/// 逗号是有用的：它逼出一个短停顿，让后面那个词更容易听清。
+pub fn carrier(word: &str) -> String {
+    if word.chars().any(dict_core::is_cjk) {
+        format!("这个词是，{word}")
+    } else {
+        format!("The word is, {word}")
+    }
 }
 
 /// 对外句柄。真正的引擎活在工作线程上。
@@ -134,44 +117,37 @@ impl Tts {
         self.status.lock().map(|s| s.clone()).unwrap_or(Status::Loading)
     }
 
-    /// 朗读一个词头。走载体句路径。
-    pub fn say_word(&self, word: &str, zh: bool) -> Result<()> {
-        self.tx.send(Msg::Word { text: word.to_string(), zh }).context("TTS 线程已退出")
+    /// 念一个词头：包成一句话再念，见 [`carrier`]。
+    pub fn say_word(&self, word: &str) -> Result<()> {
+        self.say(&carrier(word))
     }
 
-    /// 预热一个词头的合成结果。本机 RTF 约 0.35，一个词要近一秒 ——
-    /// 打开词条页就先算好，点播放时才不用等。
-    pub fn prefetch_word(&self, word: &str, zh: bool) {
-        let _ = self.tx.send(Msg::Prefetch { text: word.to_string(), zh });
+    /// 预热一个词头。
+    pub fn prefetch_word(&self, word: &str) {
+        self.prefetch(&carrier(word));
     }
 
-    /// 预热一条例句。没有独显时 CPU 合成一句要两秒半，不预热就得干等。
-    pub fn prefetch_sentence(&self, text: &str) {
-        let _ = self.tx.send(Msg::PrefetchSentence { text: text.to_string() });
+    /// 念一段现成的文字（例句用，它本来就是句子，不必再包）。
+    pub fn say(&self, text: &str) -> Result<()> {
+        self.tx.send(Msg::Play { text: text.to_string() }).context("TTS 线程已退出")
     }
 
-    /// 朗读一句例句。例句自带上下文，韵律天然更好，不需要载体句。
-    pub fn say_sentence(&self, text: &str) -> Result<()> {
-        self.tx.send(Msg::Sentence { text: text.to_string() }).context("TTS 线程已退出")
+    /// 预热，只进缓存不出声。
+    ///
+    /// 没有独显的机器上 CPU 合成一次以秒计，打开词条页就先算好，
+    /// 点播放时才不用等。
+    pub fn prefetch(&self, text: &str) {
+        let _ = self.tx.send(Msg::Warm { text: text.to_string() });
     }
 
     pub fn stop(&self) {
         let _ = self.tx.send(Msg::Stop);
     }
 
-    /// 改语速 / 载体句开关，立即生效。
-    ///
-    /// 缓存会被清掉 —— 里面存的是按旧参数合成的波形，不清就听不出变化。
-    pub fn tune(&self, speed: f32, carrier: bool) {
-        let _ = self.tx.send(Msg::Tune { speed, carrier });
-    }
-
     /// 合成一次但不播放，量出本机的 RTF。阻塞直到工作线程算完。
-    pub fn bench(&self, text: &str, zh: bool) -> Result<Bench> {
+    pub fn bench(&self, text: &str) -> Result<Bench> {
         let (tx, rx) = std::sync::mpsc::channel();
-        self.tx
-            .send(Msg::Bench { text: text.to_string(), zh, reply: tx })
-            .context("TTS 线程已退出")?;
+        self.tx.send(Msg::Bench { text: text.to_string(), reply: tx }).context("TTS 线程已退出")?;
         rx.recv().context("TTS 线程没有回应")?.context("合成失败")
     }
 }
@@ -215,18 +191,15 @@ fn worker(cfg: Config, rx: Receiver<Msg>, status: Arc<Mutex<Status>>) {
 
         let mut benches = Vec::new();
         let mut play: Option<Msg> = None;
-        // 词头和例句的预热各留最后一条：打开词条页会一次发两条，只留一条就
-        // 会把词头挤掉；而快速翻词条时积压的旧请求也不该再算，留最后的即可。
-        let mut warm_word: Option<Msg> = None;
-        let mut warm_sentence: Option<Msg> = None;
+        // 预热攒着一起做：打开词条页会一次发好几条（词头 + 例句），
+        // 一条都不能少；但快速翻词条时积压的旧请求会连着排在后面，
+        // 所以只留最后一批的量 —— 这里靠「有新的播放请求就先让路」来兜。
+        let mut warm: Vec<Msg> = Vec::new();
         for m in queue {
             match m {
                 Msg::Bench { .. } => benches.push(m),
-                Msg::Word { .. } | Msg::Sentence { .. } => play = Some(m),
-                Msg::Prefetch { .. } => warm_word = Some(m),
-                Msg::PrefetchSentence { .. } => warm_sentence = Some(m),
-                // 改参数要在这一轮的播放之前生效，所以就地处理，不进后面的择一逻辑
-                Msg::Tune { speed, carrier } => engine.tune(speed, carrier),
+                Msg::Play { .. } => play = Some(m),
+                Msg::Warm { .. } => warm.push(m),
                 Msg::Stop => {
                     engine.player.stop();
                     play = None;
@@ -236,13 +209,9 @@ fn worker(cfg: Config, rx: Receiver<Msg>, status: Arc<Mutex<Status>>) {
 
         let run = |m: Msg, engine: &mut Engine| {
             let r = match m {
-                Msg::Word { text, zh } => engine.speak_word(&text, zh),
-                Msg::Sentence { text } => engine.speak_sentence(&text),
-                Msg::Prefetch { text, zh } => engine.warm_word(&text, zh),
-                Msg::PrefetchSentence { text } => engine.warm_sentence(&text),
-                Msg::Tune { .. } => Ok(()),
-                Msg::Bench { text, zh, reply } => {
-                    let _ = zh;
+                Msg::Play { text } => engine.speak(&text),
+                Msg::Warm { text } => engine.warm(&text),
+                Msg::Bench { text, reply } => {
                     let t = std::time::Instant::now();
                     let r = engine.synth(&text, VOICE);
                     let out = r.as_ref().ok().map(|s| {
@@ -266,8 +235,7 @@ fn worker(cfg: Config, rx: Receiver<Msg>, status: Arc<Mutex<Status>>) {
         match play {
             Some(m) => run(m, &mut engine),
             None => {
-                // 词头先热：用户十有八九先点它，而且它比例句便宜
-                for m in [warm_word, warm_sentence].into_iter().flatten() {
+                for m in warm {
                     run(m, &mut engine);
                 }
             }
@@ -286,14 +254,6 @@ enum Family {
 /// 24 kHz 单声道 f32，一秒约 96 KB，例句最长几秒，128 条封顶几十 MB。
 const CACHE_CAP: usize = 128;
 
-/// 要念的东西。**词头和例句的念法不一样**（词头走载体句裁剪、例句直接合成），
-/// 所以同一段文字在两种身份下是两份不同的波形，缓存键必须分开。
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-enum Cue {
-    Word { text: String, zh: bool },
-    Sentence(String),
-}
-
 struct Engine {
     // 这三个字段的析构顺序有讲究：句柄先于库释放。
     handle: *const c_void,
@@ -302,11 +262,10 @@ struct Engine {
     destroy: ffi::FnDestroy,
     sample_rate: u32,
     model_name: String,
-    cfg: Config,
     player: audio::Player,
-    /// 要念的东西 → 合成好的样本。插入顺序另存在 `cache_order` 里做淘汰。
-    cache: std::collections::HashMap<Cue, Vec<f32>>,
-    cache_order: std::collections::VecDeque<Cue>,
+    /// 文本 → 合成好的样本。插入顺序另存在 `cache_order` 里做淘汰。
+    cache: std::collections::HashMap<String, Vec<f32>>,
+    cache_order: std::collections::VecDeque<String>,
     /// 预加载的 CUDA/cuDNN 模块，必须活到引擎销毁。
     _preloaded: Vec<DynLib>,
     _sherpa: DynLib,
@@ -422,7 +381,7 @@ impl Engine {
                 conf.model.kokoro.dict_dir = cs(opt(md.join("dict")));
                 conf.model.kokoro.lexicon = cs(lexicons(md));
                 conf.model.kokoro.lang = cs(String::new());
-                conf.model.kokoro.length_scale = 1.0 / cfg.speed.max(0.1);
+                conf.model.kokoro.length_scale = 1.0;
             }
             Family::Vits => {
                 conf.model.vits.model = cs(path(&model));
@@ -432,7 +391,7 @@ impl Engine {
                 conf.model.vits.dict_dir = cs(opt(md.join("dict")));
                 conf.model.vits.noise_scale = 0.667;
                 conf.model.vits.noise_scale_w = 0.8;
-                conf.model.vits.length_scale = 1.0 / cfg.speed.max(0.1);
+                conf.model.vits.length_scale = 1.0;
             }
         }
 
@@ -457,7 +416,6 @@ impl Engine {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            cfg: cfg.clone(),
             player: audio::Player::new()?,
             cache: std::collections::HashMap::new(),
             cache_order: std::collections::VecDeque::new(),
@@ -470,7 +428,7 @@ impl Engine {
     /// 合成一段文本，拿回 f32 样本。
     fn synth(&self, text: &str, sid: i32) -> Result<Vec<f32>> {
         let c = CString::new(text).context("待合成文本含有 NUL 字节")?;
-        let gc = ffi::GenerationConfig { speed: self.cfg.speed, sid, ..Default::default() };
+        let gc = ffi::GenerationConfig { sid, ..Default::default() };
         // SAFETY: handle 有效；c 在调用期间存活；返回的音频由 free_audio 释放。
         unsafe {
             let a = (self.generate)(
@@ -494,29 +452,14 @@ impl Engine {
         }
     }
 
-    /// 改语速 / 载体句开关。缓存里是按旧参数合成的波形，必须一并清掉。
-    fn tune(&mut self, speed: f32, carrier: bool) {
-        self.cfg.speed = speed.clamp(0.5, 2.0);
-        self.cfg.carrier = carrier;
-        self.cache.clear();
-        self.cache_order.clear();
-    }
-
-    /// 取一段要念的波形，带缓存。
-    ///
-    /// **词头和例句都走这里。** 例句原来是直接合成、既不缓存也不预取的 ——
-    /// 在 GPU 上无所谓（0.4 秒），但没有独显的机器 CPU 合成一句要两秒半，
-    /// 点一下干等两秒半是不能接受的。
-    fn samples(&mut self, cue: Cue) -> Result<Vec<f32>> {
-        if let Some(v) = self.cache.get(&cue) {
+    /// 取一段文字的波形，带缓存。
+    fn samples(&mut self, text: &str) -> Result<Vec<f32>> {
+        if let Some(v) = self.cache.get(text) {
             return Ok(v.clone());
         }
-        let out = match &cue {
-            Cue::Word { text, zh } => self.synth_word(text, *zh)?,
-            Cue::Sentence(text) => self.synth(text, VOICE)?,
-        };
-        self.cache.insert(cue.clone(), out.clone());
-        self.cache_order.push_back(cue);
+        let out = self.synth(text, VOICE)?;
+        self.cache.insert(text.to_string(), out.clone());
+        self.cache_order.push_back(text.to_string());
         while self.cache_order.len() > CACHE_CAP {
             if let Some(old) = self.cache_order.pop_front() {
                 self.cache.remove(&old);
@@ -525,44 +468,14 @@ impl Engine {
         Ok(out)
     }
 
-    /// 词头的合成：载体句 + 按停顿裁剪。见模块开头。
-    fn synth_word(&self, word: &str, zh: bool) -> Result<Vec<f32>> {
-        if self.cfg.carrier {
-            // 逗号是为了逼出一个韵律停顿，后面才好按停顿切
-            let carrier = if zh {
-                format!("这个词读作，{word}")
-            } else {
-                format!("The word is, {word}")
-            };
-            let samples = self.synth(&carrier, VOICE)?;
-            if let Some((a, b)) =
-                audio::tail_after_last_pause(&samples, self.sample_rate, 80.0, 120.0)
-            {
-                return Ok(samples[a..b].to_vec());
-            }
-            // 切不出来就退回直接合成单词，而不是把整句载体念给用户听
-        }
-        self.synth(word, VOICE)
-    }
-
-    fn speak_word(&mut self, word: &str, zh: bool) -> Result<()> {
-        let s = self.samples(Cue::Word { text: word.to_string(), zh })?;
+    fn speak(&mut self, text: &str) -> Result<()> {
+        let s = self.samples(text)?;
         self.play(&s)
     }
 
     /// 只算进缓存，不出声。
-    fn warm_word(&mut self, word: &str, zh: bool) -> Result<()> {
-        self.samples(Cue::Word { text: word.to_string(), zh }).map(|_| ())
-    }
-
-    fn speak_sentence(&mut self, text: &str) -> Result<()> {
-        let s = self.samples(Cue::Sentence(text.to_string()))?;
-        self.play(&s)
-    }
-
-    /// 例句也预热。CPU 上这一步能把「点了等两秒半」变成「点了就响」。
-    fn warm_sentence(&mut self, text: &str) -> Result<()> {
-        self.samples(Cue::Sentence(text.to_string())).map(|_| ())
+    fn warm(&mut self, text: &str) -> Result<()> {
+        self.samples(text).map(|_| ())
     }
 
     fn play(&mut self, samples: &[f32]) -> Result<()> {
@@ -634,3 +547,25 @@ impl Drop for Engine {
 
 // Engine 只在它自己的工作线程上被创建和使用；跨线程的只有 Tts 句柄里的 Sender。
 unsafe impl Send for Engine {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 载体句的语言跟着词走，而不是跟着界面走 ——
+    /// 中文词条页里也可能点到英文词，反过来也一样。
+    #[test]
+    fn the_carrier_follows_the_word_not_the_ui() {
+        assert_eq!(carrier("将就"), "这个词是，将就");
+        assert_eq!(carrier("compile"), "The word is, compile");
+        // 混着的按中文算：只要有汉字，中文那句读起来就不会错
+        assert_eq!(carrier("C 语言"), "这个词是，C 语言");
+    }
+
+    /// 逗号不能掉 —— 它逼出的那个短停顿是词能被听清的原因。
+    #[test]
+    fn the_carrier_keeps_the_pause() {
+        assert!(carrier("银行").contains('，'));
+        assert!(carrier("bank").contains(','));
+    }
+}

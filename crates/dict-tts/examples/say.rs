@@ -5,9 +5,7 @@
 //! cargo run --release -p dict-tts --example say -- models/kokoro-multi-lang-v1_1
 //! ```
 //!
-//! 默认只测 RTF 不出声（无人值守也能跑）；加 `--play` 才实际播放，
-//! 并且同一批词分别用「载体句裁剪」和「直接喂单词」各念一遍，方便用耳朵 A/B ——
-//! 神经 TTS 在无上下文短文本上韵律会退化成平调，这个差别只能听。
+//! 默认只测 RTF 不出声（无人值守也能跑）；加 `--play` 才实际念出来。
 
 use dict_tts::{Config, Status, Tts};
 use std::path::PathBuf;
@@ -77,7 +75,6 @@ fn main() -> anyhow::Result<()> {
         provider: provider.clone(),
         dll_dirs: dll_dirs.clone(),
         num_threads: threads,
-        ..Default::default()
     });
     let t0 = Instant::now();
     match wait_ready(&tts) {
@@ -93,25 +90,21 @@ fn main() -> anyhow::Result<()> {
     println!("{}", "─".repeat(66));
 
     let mut worst: f64 = 0.0;
-    let mut report = |label: &str, text: &str, zh: bool| -> anyhow::Result<()> {
+    let mut report = |label: &str, text: &str| -> anyhow::Result<()> {
         // 头一次调用会有一次性开销，量第二次
-        let _ = tts.bench(text, zh)?;
-        let b = tts.bench(text, zh)?;
+        let _ = tts.bench(text)?;
+        let b = tts.bench(text)?;
         worst = worst.max(b.rtf);
         println!("{label:<34} {:>8.0} ms {:>8.0} ms {:>8.3}", b.synth_ms, b.audio_ms, b.rtf);
         Ok(())
     };
 
     for w in &words {
-        let zh = w.chars().any(dict_core::is_cjk);
-        // 词头走的是载体句，实际合成的文本比词本身长，按载体句量才准
-        let carrier =
-            if zh { format!("这个词读作，{w}") } else { format!("The word is, {w}") };
-        report(&format!("词头 {w}"), &carrier, zh)?;
+        // 词头实际合成的是包好的那句话，按它量才准
+        report(&format!("词头 {w}"), &dict_tts::carrier(w))?;
     }
     for s in sentences {
-        let zh = s.chars().any(dict_core::is_cjk);
-        report(&format!("例句 {}", s.chars().take(12).collect::<String>()), s, zh)?;
+        report(&format!("例句 {}", s.chars().take(12).collect::<String>()), s)?;
     }
 
     println!("{}", "─".repeat(66));
@@ -128,26 +121,21 @@ fn main() -> anyhow::Result<()> {
     );
 
     if play {
-        println!("\n开始试听（载体句裁剪 开 → 关）");
-        for carrier in [true, false] {
-            println!("── 载体句裁剪: {}", if carrier { "开" } else { "关" });
-            let t = Tts::start(Config {
-                lib_dir: lib_dir.clone(),
-                model_dir: model_dir.clone(),
-                provider: provider.clone(),
-                dll_dirs: dll_dirs.clone(),
-                num_threads: threads,
-                carrier,
-                ..Default::default()
-            });
-            wait_ready(&t);
-            for w in &words {
-                let zh = w.chars().any(dict_core::is_cjk);
-                t.say_word(w, zh)?;
-                println!("   {w}");
-                std::thread::sleep(Duration::from_millis(1800));
-            }
+        println!(
+            "
+开始试听"
+        );
+        for w in &words {
+            tts.say_word(w)?;
+            println!("   {w}");
+            std::thread::sleep(Duration::from_millis(1800));
+        }
+        for s in sentences {
+            tts.say(s)?;
+            println!("   {}", s.chars().take(16).collect::<String>());
+            std::thread::sleep(Duration::from_millis(3000));
         }
     }
+
     Ok(())
 }

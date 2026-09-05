@@ -366,13 +366,6 @@ impl App {
         self.cfg_dirty = false;
     }
 
-    /// 把语速 / 载体句开关的改动送到 TTS 线程。
-    fn push_tuning(&self) {
-        if let Some(t) = self.speech.as_ref() {
-            t.tune(self.cfg.speed, self.cfg.carrier);
-        }
-    }
-
     // ─────────────────────── 检索 ───────────────────────
 
     fn refresh(&mut self) {
@@ -414,9 +407,9 @@ impl App {
         // 没有独显的机器上 CPU 合成一个词头约 1.4 秒、一句例句约 2.4 秒 ——
         // 不预热的话点一下就是干等那么久。第一条例句最常被点，也一并热上。
         if let Some(t) = self.speech.as_ref() {
-            t.prefetch_word(&e.word, e.is_zh());
+            t.prefetch_word(&e.word);
             if let Some(ex) = e.examples.first() {
-                t.prefetch_sentence(&ex.a);
+                t.prefetch(&ex.a);
             }
         }
         self.entry = Some(e);
@@ -836,6 +829,7 @@ impl App {
         let p = self.palette;
         let zh = e.is_zh();
         let mut goto: Option<String> = None;
+        // (要念的文字, 是不是词头)。词头要包成一句话再念，例句本来就是句子。
         let mut say: Option<(String, bool)> = None;
 
         ui.add_space(18.0);
@@ -851,7 +845,7 @@ impl App {
                 ui.label(self.text(&e.reading, fonts::sans(18.0), p.muted));
             }
             if self.sound_icon(ui, 17.0, "朗读词头") {
-                say = Some((e.word.clone(), zh));
+                say = Some((e.word.clone(), true));
             }
         });
 
@@ -932,9 +926,7 @@ impl App {
                     let fb = if zh { fonts::sans(13.5) } else { fonts::serif(14.5) };
                     // 两行各带一个发声键：例句是中英对照的，查中文时想听英文
                     // 那句、查英文时想听中文那句，都是常事
-                    for (text, font, color, is_zh) in
-                        [(&ex.a, fa, p.ink_soft, zh), (&ex.b, fb, p.muted, !zh)]
-                    {
+                    for (text, font, color) in [(&ex.a, fa, p.ink_soft), (&ex.b, fb, p.muted)] {
                         // 用 wrapped：长句子换行后，发声键跟在最后一行末尾，
                         // 不会被挤出可视区
                         ui.horizontal_wrapped(|ui| {
@@ -949,7 +941,7 @@ impl App {
                                 self.sound_icon(ui, ICON, "朗读这一句")
                             });
                             if hit.inner {
-                                say = Some((text.to_string(), is_zh));
+                                say = Some((text.to_string(), false));
                             }
                         });
                         ui.add_space(2.0);
@@ -997,12 +989,12 @@ impl App {
         if let Some(w) = goto {
             self.open_word(&w);
         }
-        if let Some((t, zh)) = say {
-            self.speak(&t, zh);
+        if let Some((t, headword)) = say {
+            self.speak(&t, headword);
         }
     }
 
-    fn speak(&mut self, text: &str, zh: bool) {
+    fn speak(&mut self, text: &str, headword: bool) {
         let Some(tts) = self.speech.as_ref() else {
             self.note = "发音不可用".into();
             return;
@@ -1011,12 +1003,7 @@ impl App {
             dict_tts::Status::Failed(e) => self.note = format!("语音模型加载失败: {e}"),
             dict_tts::Status::Loading => self.note = "语音模型还在加载".into(),
             dict_tts::Status::Ready { .. } => {
-                // 单个词走载体句合成再裁剪，整句直接合成
-                let r = if text.chars().count() <= 8 && !text.contains(['。', '.', '，', ',']) {
-                    tts.say_word(text, zh)
-                } else {
-                    tts.say_sentence(text)
-                };
+                let r = if headword { tts.say_word(text) } else { tts.say(text) };
                 if let Err(e) = r {
                     self.note = format!("合成失败: {e}");
                 }
@@ -1251,57 +1238,6 @@ impl App {
         let p = self.palette;
         ui.add_space(14.0);
         ui.label(self.text("设置", fonts::serif(26.0), p.ink));
-        ui.add_space(3.0);
-        ui.label(self.text("Esc 返回查词", fonts::sans(12.0), p.faint));
-
-        // ── 发音 ──
-        self.section(ui, "发音");
-        let status = self.speech.as_ref().map(|t| t.status());
-        match status {
-            Some(dict_tts::Status::Ready { sample_rate, model }) => {
-                self.row(ui, "模型", |ui| {
-                    ui.label(self.text(
-                        &format!("{model} · {sample_rate} Hz"),
-                        fonts::sans(13.0),
-                        p.ink_soft,
-                    ));
-                });
-
-                let mut speed = self.cfg.speed;
-                self.row(ui, "语速", |ui| {
-                    ui.add(egui::Slider::new(&mut speed, 0.5..=2.0).fixed_decimals(2));
-                });
-                if (speed - self.cfg.speed).abs() > f32::EPSILON {
-                    self.cfg.speed = speed;
-                    self.cfg_dirty = true;
-                    self.push_tuning();
-                }
-
-                let mut carrier = self.cfg.carrier;
-                self.row(ui, "载体句裁剪", |ui| {
-                    ui.checkbox(&mut carrier, "");
-                    ui.label(self.text(
-                        "合成「这个词读作，X」再切出 X；关掉即直接喂单词",
-                        fonts::sans(12.0),
-                        p.faint,
-                    ));
-                });
-                if carrier != self.cfg.carrier {
-                    self.cfg.carrier = carrier;
-                    self.cfg_dirty = true;
-                    self.push_tuning();
-                }
-            }
-            Some(dict_tts::Status::Loading) => self.row(ui, "模型", |ui| {
-                ui.label(self.text("加载中…", fonts::sans(13.0), p.muted));
-            }),
-            Some(dict_tts::Status::Failed(e)) => self.row(ui, "模型", |ui| {
-                ui.label(self.text(&format!("加载失败：{e}"), fonts::sans(13.0), p.muted));
-            }),
-            None => self.row(ui, "模型", |ui| {
-                ui.label(self.text("不可用", fonts::sans(13.0), p.muted));
-            }),
-        }
 
         // ── 窗口 ──
         self.section(ui, "窗口");

@@ -105,7 +105,6 @@ fn run() -> Result<()> {
                 num_threads: std::thread::available_parallelism()
                     .map(|n| (n.get() / 2).clamp(2, 8) as i32)
                     .unwrap_or(4),
-                ..Default::default()
             };
             (Some(cfg), String::new())
         }

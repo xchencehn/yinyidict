@@ -89,73 +89,6 @@ pub fn to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     out
 }
 
-/// 逐窗口的均方根能量。窗口以样本数给出。
-fn rms_windows(samples: &[f32], win: usize) -> Vec<f32> {
-    samples
-        .chunks(win)
-        .map(|c| (c.iter().map(|s| s * s).sum::<f32>() / c.len().max(1) as f32).sqrt())
-        .collect()
-}
-
-/// 从载体句里切出末尾的目标词。
-///
-/// 合成「这个词读作，将就」而不是孤零零的「将就」—— 神经 TTS 在无上下文短文本上
-/// 韵律模型会退化成平调，这跟模型好坏无关。合成完再按最后一处静音把目标段切出来。
-///
-/// 找不到足够长的静音间隔时返回 `None`，调用方应当整句播放而不是乱切。
-pub fn tail_after_last_pause(
-    samples: &[f32],
-    sample_rate: u32,
-    min_pause_ms: f32,
-    min_tail_ms: f32,
-) -> Option<(usize, usize)> {
-    if samples.is_empty() {
-        return None;
-    }
-    let win = (sample_rate as f32 * 0.01).max(1.0) as usize; // 10 ms
-    let e = rms_windows(samples, win);
-    if e.is_empty() {
-        return None;
-    }
-    let peak = e.iter().copied().fold(0.0f32, f32::max);
-    if peak <= 0.0 {
-        return None;
-    }
-    // 相对阈值：绝对阈值在不同模型的响度下不通用
-    let quiet = peak * 0.06;
-
-    // 先掐掉尾部静音
-    let mut end = e.len();
-    while end > 0 && e[end - 1] < quiet {
-        end -= 1;
-    }
-    if end == 0 {
-        return None;
-    }
-
-    let min_pause = (min_pause_ms / 10.0).round() as usize;
-    let min_tail = (min_tail_ms / 10.0).round() as usize;
-
-    // 从有声部分的末尾往回找一段足够长的静音
-    let mut i = end;
-    while i > 0 {
-        if e[i - 1] < quiet {
-            let gap_end = i;
-            let mut gap_start = i;
-            while gap_start > 0 && e[gap_start - 1] < quiet {
-                gap_start -= 1;
-            }
-            if gap_end - gap_start >= min_pause && end - gap_end >= min_tail {
-                return Some((gap_end * win, (end * win).min(samples.len())));
-            }
-            i = gap_start;
-        } else {
-            i -= 1;
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,51 +104,5 @@ mod tests {
         // 满幅样本要落在 i16 的边界上
         assert_eq!(i16::from_le_bytes(w[46..48].try_into().unwrap()), i16::MAX);
         assert_eq!(i16::from_le_bytes(w[48..50].try_into().unwrap()), -i16::MAX);
-    }
-
-    /// 造一段「响 — 静 — 响」，检查能不能切出最后一段。
-    fn three_part(sr: u32, a_ms: u32, gap_ms: u32, b_ms: u32) -> Vec<f32> {
-        let n = |ms: u32| (sr as f32 * ms as f32 / 1000.0) as usize;
-        let mut v = Vec::new();
-        v.extend((0..n(a_ms)).map(|i| if i % 2 == 0 { 0.8 } else { -0.8 }));
-        v.extend(std::iter::repeat_n(0.0, n(gap_ms)));
-        v.extend((0..n(b_ms)).map(|i| if i % 2 == 0 { 0.7 } else { -0.7 }));
-        v
-    }
-
-    #[test]
-    fn finds_the_tail_after_a_real_pause() {
-        let sr = 24000;
-        let s = three_part(sr, 500, 200, 400);
-        let (a, b) = tail_after_last_pause(&s, sr, 80.0, 120.0).expect("应当找到静音间隔");
-        // 切点应落在静音段末尾附近，容忍一个窗口的误差
-        let expect = (sr as f32 * 0.7) as usize;
-        assert!(
-            (a as isize - expect as isize).abs() < sr as isize / 50,
-            "切点 {a}，期望约 {expect}"
-        );
-        assert!(b > a && b <= s.len());
-    }
-
-    #[test]
-    fn refuses_to_cut_when_there_is_no_pause() {
-        let sr = 24000;
-        // 全程有声，没有可切的地方
-        let s: Vec<f32> = (0..sr as usize).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
-        assert!(tail_after_last_pause(&s, sr, 80.0, 120.0).is_none());
-    }
-
-    #[test]
-    fn refuses_when_the_tail_would_be_too_short() {
-        let sr = 24000;
-        // 末段只有 30 ms，短于 min_tail
-        let s = three_part(sr, 500, 200, 30);
-        assert!(tail_after_last_pause(&s, sr, 80.0, 120.0).is_none());
-    }
-
-    #[test]
-    fn handles_silence_and_empty_input() {
-        assert!(tail_after_last_pause(&[], 24000, 80.0, 120.0).is_none());
-        assert!(tail_after_last_pause(&[0.0; 1000], 24000, 80.0, 120.0).is_none());
     }
 }

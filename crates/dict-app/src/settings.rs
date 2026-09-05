@@ -43,10 +43,6 @@ pub struct Settings {
     pub start_hidden: bool,
     pub theme: Theme,
 
-    pub speed: f32,
-    /// 载体句合成再裁剪。关掉就是直接喂单词，留着做 A/B。
-    pub carrier: bool,
-
     pub exact_bonus: f32,
     pub lambda: f32,
     pub secondary: f32,
@@ -65,8 +61,6 @@ impl Default for Settings {
             close_to_tray: true,
             start_hidden: false,
             theme: Theme::Auto,
-            speed: 1.0,
-            carrier: true,
             exact_bonus: p.exact_bonus,
             lambda: p.lambda,
             secondary: p.secondary,
@@ -118,7 +112,6 @@ impl Settings {
             }
             *cur = cur.min(4000.0);
         }
-        self.speed = self.speed.clamp(0.5, 2.0);
         self.exact_bonus = self.exact_bonus.clamp(0.0, 24.0);
         self.lambda = self.lambda.clamp(0.0, 4.0);
         self.secondary = self.secondary.clamp(0.0, 1.0);
@@ -160,19 +153,17 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let s = Settings { speed: 1.25, theme: Theme::Dark, ..Default::default() };
+        let s = Settings { theme: Theme::Dark, ..Default::default() };
         let text = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(back.theme, Theme::Dark);
-        assert!((back.speed - 1.25).abs() < 1e-6);
     }
 
     #[test]
     fn missing_fields_fall_back_to_defaults() {
         // 老版本写的文件、或者手改漏了字段，不该让整份设置作废。
-        // 这里那两个字段是上一版才有的（音色），现在多出来也不能让文件作废
+        // speaker_zh / speed 都是早先版本才有的字段，现在多出来也不能作废
         let s: Settings = serde_json::from_str(r#"{"speed": 1.5, "speaker_zh": 7}"#).unwrap();
-        assert!((s.speed - 1.5).abs() < 1e-6);
         assert_eq!(s.theme, Theme::Auto);
         assert!(s.close_to_tray);
         assert_eq!(s.hotkey, Hotkey::default());
@@ -202,10 +193,8 @@ mod tests {
     #[test]
     fn absurd_values_get_clamped() {
         let s: Settings =
-            serde_json::from_str(r#"{"speed": 99.0, "lambda": -5.0, "max_secondary": 500}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"lambda": -5.0, "max_secondary": 500}"#).unwrap();
         let s = s.sanitized();
-        assert_eq!(s.speed, 2.0);
         assert_eq!(s.lambda, 0.0);
         assert_eq!(s.max_secondary, 8);
     }
