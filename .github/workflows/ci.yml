@@ -8,7 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # 故意不设全局 RUSTFLAGS=-D warnings：cargo 会把它一并传给所有依赖，
+  # 哪天某个依赖冒一条 warning 就把 CI 弄红。只在 clippy 那一步收紧。
 
 jobs:
   # windows-latest 自带 MSVC，正好替我们跑一遍 msvc 这条路 ——
