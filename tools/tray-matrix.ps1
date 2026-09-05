@@ -51,8 +51,10 @@ public class T {
 }
 "@
 
-$EXE = "C:\Users\chen.chen2\Desktop\workdir\dictionary\target\release\dict.exe"
-$CWD = "C:\Users\chen.chen2\Desktop\workdir\dictionary"
+# 从脚本自己的位置推工程根，别钉死绝对路径
+$CWD = Split-Path -Parent $PSScriptRoot
+$EXE = Join-Path $CWD 'target\release\dict.exe'
+if (-not (Test-Path $EXE)) { throw "找不到 $EXE —— 先跑 cargo build --release -p dict-app" }
 $MENU_X = 600; $MENU_Y = 500
 
 function Kill-All { Get-Process dict -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 400 }
