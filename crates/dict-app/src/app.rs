@@ -62,6 +62,11 @@ pub struct App {
     cfg_dirty: bool,
     tray: Option<Tray>,
     visible: bool,
+    /// 主窗口的 HWND。0 = 拿不到，那就只能跳过那些要问 Win32 的判断。
+    main_hwnd: usize,
+    /// 主窗口正被「借」着用来开设置子窗口：它此刻在屏幕外，开完就收回去。
+    /// 里面记的是借之前的位置。见 [`App::want_settings`]。
+    parked: Option<Pos2>,
     /// 设置子窗口开着没有。
     settings_open: bool,
     /// 设置窗口刚打开，下一帧要把焦点给它。
@@ -70,13 +75,14 @@ pub struct App {
     painted: bool,
     /// 画过多少帧。只用来数「再等一帧」，溢出不可能。
     frames: u64,
-    /// 攒着的「打开设置」：等 `frames` 到这个数才真的开。
+    /// 攒着的「打开设置」：等 `frames` 到这个数、而且主窗口真的露了头，
+    /// 才把设置子窗口建出来。
     ///
-    /// 设置是主窗口的 immediate 子视口，建它的时候父窗口必须已经在屏幕上。
-    /// 托盘线程刚把窗口 `ShowWindow` 出来，这一轮 egui 循环里父窗口可能还没
-    /// 画过一帧 —— eframe 建不出子窗口就跳过回调，egui 于是
-    /// `panic: the user callback was never called`，**整个程序当场退出**。
-    /// 所以一律等主窗口再画过一帧，代价是最多晚一帧，看不出来。
+    /// 隔一帧是因为托盘事件在 `logic()` 里收，请求和建窗口挤在同一帧里过。
+    /// 「露头」那一条是这里最要紧的前提，理由整条记在 [`App::want_settings`]：
+    /// immediate 子视口只能在由窗口消息驱动的帧里建，而主窗口藏着时根本
+    /// 没有那种帧 —— 在别的帧里建，egui 会 panic，程序当场退出。
+    /// `frames` 只在 `ui()` 里涨，所以它同时也证明了「界面确实在出帧」。
     settings_after: Option<u64>,
     /// 还没放出去的开机杂活，见 [`Deferred`]。
     deferred: Option<Deferred>,
@@ -109,6 +115,33 @@ pub fn decide_close(quitting: bool, close_to_tray: bool, has_tray: bool) -> Clos
     }
 }
 
+/// 按下 Esc 该退哪一步。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EscAct {
+    /// 从词条页退回候选。
+    ToList,
+    /// 清空输入框。
+    Clear,
+    /// 已经空了，没什么可退的了 —— 关窗口。
+    CloseWindow,
+}
+
+/// Esc 的三段式：一退候选，二清输入框，三关窗口。
+///
+/// 第三段是后来补的：空框上按 Esc 原来什么也不发生，而那时候用户想做的
+/// 显然是「收工」—— 手还在键盘上，不该为了收起窗口去摸鼠标点右上角。
+/// 关窗口走的是和标题栏那个 × 完全同一条路（[`decide_close`] 再定夺是
+/// 收进托盘还是真退出），所以「关闭 = 收进托盘」那个开关对两边一样管事。
+pub fn decide_esc(in_entry: bool, query_empty: bool) -> EscAct {
+    if in_entry {
+        EscAct::ToList
+    } else if query_empty {
+        EscAct::CloseWindow
+    } else {
+        EscAct::Clear
+    }
+}
+
 /// 窗口的出厂尺寸。窄而高 —— 词条是竖着长的，宽了只是浪费。
 ///
 /// 真正用的是 `settings.json` 里记着的那个，这里只是没记录时的起点。
@@ -118,6 +151,12 @@ pub const WINDOW_DEFAULT: [f32; 2] = [458.0, 632.0];
 pub const WINDOW_MIN: [f32; 2] = [400.0, 320.0];
 /// 自绘标题栏的高度。
 pub const TITLE_H: f32 = 34.0;
+
+/// 「借主窗口一帧」时把它挪到哪儿去。见 [`App::park`]。
+///
+/// 单位是逻辑点，乘上缩放才是像素 —— 取 −20000 是因为它换算成像素之后
+/// 仍然远在任何显示器排布之外，又还留在 Win32 那些老接口惯用的 16 位量级里。
+const PARK: Pos2 = Pos2::new(-20000.0, -20000.0);
 
 /// 开机就该做、但不该和开窗口抢资源的杂活。见 [`App::start_deferred`]。
 pub struct Deferred {
@@ -227,6 +266,8 @@ impl App {
             font_report: report.join("  "),
             shot,
             visible: !(cfg.start_hidden && tray.is_some()),
+            main_hwnd,
+            parked: None,
             tray,
             cfg,
             cfg_path,
@@ -249,6 +290,70 @@ impl App {
     fn open_settings(&mut self) {
         self.settings_open = true;
         self.settings_focus_pending = true;
+    }
+
+    /// 主窗口此刻是不是真的在屏幕上（问 Win32，不看自己的记账）。
+    ///
+    /// 拿不到句柄时只能当成「在」—— 那条路上本来也没有别的办法。
+    fn on_screen(&self) -> bool {
+        self.main_hwnd == 0
+            || crate::tray::win_state(self.main_hwnd) == crate::tray::WinState::Front
+    }
+
+    /// 打开设置窗口，**不把词典搬上屏幕**。
+    ///
+    /// > **踩过的坑：immediate 子视口只能在「由窗口消息驱动的那种帧」里建。**
+    /// >
+    /// > eframe 建子窗口要用当前的事件循环，而它只在 `window_event` /
+    /// > `user_event` 这两条路上把事件循环放进上下文里（`with_event_loop_context`）。
+    /// > 主窗口藏起来时 Win32 不给它发 `WM_PAINT`，eframe 于是绕过消息循环
+    /// > 直接来一帧（`check_redraw_requests` 里对隐藏窗口的直呼路，从
+    /// > `new_events` 进来的那条**没有**包上下文）。在那种帧里建子视口，
+    /// > eframe 拿不到事件循环就建不出窗口、跳过回调，egui 当场
+    /// > `panic: the user callback was never called` —— **整个程序退出**。
+    /// > 用户看到的就是「词典藏在托盘里，点设置，软件没了」。
+    /// >
+    /// > 所以主窗口必须真的可见，哪怕只可见一两帧。办法是**先挪到屏幕外再
+    /// > 显示**（[`App::park`]）：用户看不见，Win32 却照常发 `WM_PAINT`，
+    /// > 那一帧就有事件循环可用。子窗口一建出来就把主窗口收回去。
+    /// >
+    /// > 收回去之后帧也不会断 —— eframe 判「这一帧要不要跑界面」是
+    /// > 「自己可见 || 有可见的子孙」，设置窗口就是那个可见的子孙；
+    /// > 而已经建好的子视口再刷新并不需要事件循环。
+    fn want_settings(&mut self, ctx: &egui::Context) {
+        if self.settings_open {
+            // 已经开着，那就只是把它叫到前面来
+            self.settings_focus_pending = true;
+            ctx.request_repaint();
+            return;
+        }
+        if !self.on_screen() {
+            self.park(ctx);
+        }
+        self.settings_after = Some(self.frames + 1);
+        ctx.request_repaint();
+    }
+
+    /// 把主窗口挪到屏幕外再显示出来，借它一帧带事件循环的帧。见 [`App::want_settings`]。
+    fn park(&mut self, ctx: &egui::Context) {
+        if self.parked.is_some() {
+            return;
+        }
+        // 借之前的位置要记住：收回去时得还原，否则下次唤出词典会出现在屏幕外
+        let home = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(Pos2::ZERO);
+        self.parked = Some(home);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(PARK));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    }
+
+    /// 把借出去的主窗口还回去：位置复原，然后重新藏起来。
+    ///
+    /// **必须在 `settings_window` 之后调**，子视口得先真的建出来 ——
+    /// 早一步就又回到「没有可见的子孙，主窗口也不可见」，设置窗口刷不出来。
+    fn unpark(&mut self, ctx: &egui::Context) {
+        let Some(home) = self.parked.take() else { return };
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(home));
+        self.dismiss(ctx);
     }
 
     /// 托盘已经把窗口显示出来了，这里把这个事实同步给 eframe。
@@ -330,10 +435,19 @@ impl App {
     /// egui 不出帧，`ui()` 根本不会被调用，热键就没人响应了。
     fn pump_tray(&mut self, ctx: &egui::Context) {
         // 攒着的「打开设置」：主窗口又画过一帧，说明叫窗口的命令已经生效了
+        // 攒着的「打开设置」。两个条件都要满足才动手：
+        // 界面确实又画过一帧（子视口不能和请求同一帧建），而且主窗口此刻
+        // 真的在屏幕上（只有那种帧里才有事件循环可用）—— 两条都在
+        // want_settings 的文档里。
         if let Some(n) = self.settings_after {
-            if self.frames >= n {
+            if self.frames >= n && self.on_screen() {
                 self.settings_after = None;
                 self.open_settings();
+            } else if self.frames > n + 60 {
+                // 怎么也没等到主窗口露头。与其让它在屏幕外一直挂着，
+                // 不如放弃这一次并说一声（unpark 随后会把它收回去）。
+                self.settings_after = None;
+                self.note = "设置窗口打不开".into();
             } else {
                 ctx.request_repaint();
             }
@@ -345,10 +459,15 @@ impl App {
                 Act::Keep => {}
                 Act::Summon { focus } => self.revealed(ctx, focus),
                 Act::Dismiss => self.dismiss(ctx),
-                Act::OpenSettings => {
-                    self.revealed(ctx, false);
-                    // 见 settings_after 的文档：早一帧开会 panic
-                    self.settings_after = Some(self.frames + 1);
+                Act::OpenSettings { tuck } => {
+                    // 最小化那一种托盘线程已经替我们收进托盘了（最小化的窗口
+                    // 不出帧，子视口画不出来，见 tray::tuck_away），这里只把
+                    // 记账和 winit 缓存的标志位跟着对齐 —— 不然下次「关窗口
+                    // 收进托盘」会被它当成无事发生。
+                    if tuck {
+                        self.dismiss(ctx);
+                    }
+                    self.want_settings(ctx);
                 }
                 Act::Quit => self.quit(ctx),
             }
@@ -451,15 +570,18 @@ impl App {
             self.show_bar = !self.show_bar;
         }
         if esc {
-            match self.mode {
-                Mode::Entry => self.mode = Mode::List,
-                Mode::List => {
+            match decide_esc(self.mode == Mode::Entry, self.query.is_empty()) {
+                EscAct::ToList => self.mode = Mode::List,
+                EscAct::Clear => {
                     self.query.clear();
                     self.last_query.clear();
                     self.cands.clear();
                     self.sel = 0;
                     self.last_ms = 0.0;
                 }
+                // 和右上角那个 × 发的是同一条命令，收进托盘还是真退出
+                // 由 pump_close 统一定夺
+                EscAct::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
     }
@@ -1351,8 +1473,12 @@ impl App {
     /// `Fn + Send + Sync + 'static`，就得把设置涉及的一堆状态搬进 Arc<Mutex>；
     /// immediate 的回调能直接借 `&mut self`，这里的状态量不值得为它换架构。
     ///
-    /// 代价是子窗口由主窗口这一帧驱动 —— 主窗口藏起来时 egui 不出帧，
-    /// 子窗口也就不刷新。所以凡是打开设置的地方都先把主窗口叫出来。
+    /// 代价是子窗口由主窗口那一帧驱动，主窗口不出帧它就不刷新。收进托盘不算
+    /// 停帧（eframe 会绕过消息循环给隐藏窗口来一帧），所以**设置窗口能在主
+    /// 窗口藏着的时候单独开出来** —— 一旦这个子视口自己是可见的，eframe 就
+    /// 认「有可见的子孙」，照样给整帧（`is_viewport_or_descendant_visible`）。
+    /// 真会停帧的只有最小化，那一种在开之前先把主窗口收进托盘，
+    /// 见 `tray::tuck_away`。
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -1492,6 +1618,10 @@ impl App {
 
         let Some(step) = plan.current() else {
             println!("截图脚本走完，退出");
+            // `quitting` 这一句不能省：关闭请求要到**下一帧**才走到
+            // pump_close，而那时 `shot` 已经清掉了 —— 于是「退出」被
+            // 「关窗口 = 收进托盘」拦下来，截图跑完进程还藏在托盘里。
+            self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             self.shot = None;
             return;
@@ -1644,6 +1774,11 @@ impl eframe::App for App {
         }
 
         self.settings_window(&ctx);
+        // 设置窗口已经建出来（或者这次没建成），借去的主窗口该还了。
+        // 放在 settings_window 之后，见 unpark 的说明。
+        if self.settings_after.is_none() {
+            self.unpark(&ctx);
+        }
         // 放在最后：见 resize_edges 的说明，早了会被内容吃掉
         ui.scope_builder(UiBuilder::new().max_rect(whole), |ui| self.resize_edges(ui));
     }
@@ -1779,7 +1914,7 @@ fn params_eq(a: &Params, b: &Params) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_close, CloseAct};
+    use super::{decide_close, decide_esc, CloseAct, EscAct};
 
     /// 「退出」发的 Close 不能被「关窗口 = 收进托盘」拦下来。
     #[test]
@@ -1793,5 +1928,16 @@ mod tests {
     fn without_a_tray_to_hide_into_closing_really_closes() {
         assert_eq!(decide_close(false, true, false), CloseAct::Exit, "托盘起不来");
         assert_eq!(decide_close(false, false, true), CloseAct::Exit, "用户关掉了收进托盘");
+    }
+
+    /// Esc 一路按下去必须一直有反应：候选 ← 词条，清空 ← 有字，关窗口 ← 空框。
+    ///
+    /// 最后那一段以前是没有的 —— 空框上按 Esc 一点反应都没有。
+    #[test]
+    fn escape_always_backs_out_one_more_step() {
+        assert_eq!(decide_esc(true, false), EscAct::ToList, "词条页，框里有字");
+        assert_eq!(decide_esc(true, true), EscAct::ToList, "词条页，框是空的");
+        assert_eq!(decide_esc(false, false), EscAct::Clear, "候选页，框里有字");
+        assert_eq!(decide_esc(false, true), EscAct::CloseWindow, "候选页，框已经空了");
     }
 }

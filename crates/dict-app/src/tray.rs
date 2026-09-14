@@ -35,6 +35,8 @@ const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 /// 激活并还原：最小化的展开，藏起来的显示出来。
 const SW_HIDE: i32 = 0;
 const SW_RESTORE: i32 = 9;
+/// 按原位显示，但不抢焦点。只在 [`tuck_away`] 里用，而且是在屏幕外用。
+const SW_SHOWNOACTIVATE: i32 = 4;
 const WM_APP: u32 = 0x8000;
 /// 托盘图标的回调消息。
 const WM_TRAY: u32 = WM_APP + 1;
@@ -118,6 +120,26 @@ struct Point {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+/// `WINDOWPLACEMENT`。要它只为一件事：把「还原之后摆在哪」读出来、改掉、再放回去。
+#[repr(C)]
+struct WindowPlacement {
+    length: u32,
+    flags: u32,
+    show_cmd: u32,
+    min_pos: Point,
+    max_pos: Point,
+    normal: Rect,
+}
+
+#[repr(C)]
 struct Msg {
     hwnd: Hwnd,
     message: u32,
@@ -181,6 +203,8 @@ extern "system" {
     fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
     fn IsWindowVisible(h: Hwnd) -> i32;
     fn IsIconic(h: Hwnd) -> i32;
+    fn GetWindowPlacement(h: Hwnd, p: *mut WindowPlacement) -> i32;
+    fn SetWindowPlacement(h: Hwnd, p: *const WindowPlacement) -> i32;
     fn MessageBoxW(h: Hwnd, text: *const u16, cap: *const u16, ty: u32) -> i32;
     fn CreateIconIndirect(info: *const IconInfo) -> Hicon;
     fn LoadImageW(
@@ -358,8 +382,15 @@ pub enum Act {
     Summon { focus: bool },
     /// 收进托盘。
     Dismiss,
-    /// 叫出主窗口（焦点留给子窗口）并打开设置。
-    OpenSettings,
+    /// 打开设置窗口，**主窗口一律不搬上屏幕**。
+    ///
+    /// `tuck` = 打开之前先把主窗口收进托盘。只有它最小化时才为真，原因是
+    /// 最小化的窗口 eframe 不给它出帧（`info.visible()` 由 `IsIconic` 推出来），
+    /// 而设置是它的 immediate 子视口，没有那一帧就画不出来。收进托盘的窗口
+    /// 反倒照常出帧 —— Win32 不给隐藏窗口发 `WM_PAINT`，但 eframe 会绕过
+    /// 消息循环直接来一帧（`is_invisible_or_minimized` 那条路）。
+    /// 见 [`tuck_away`]：收的过程在屏幕外完成，看不见闪。
+    OpenSettings { tuck: bool },
     /// 真的退出。
     Quit,
 }
@@ -372,9 +403,9 @@ pub enum Act {
 ///
 /// | 窗口 | 词典 | 设置 | 退出 |
 /// |---|---|---|---|
-/// | 在眼前 | 保持 | 设置窗口出现 | 退出 |
-/// | 最小化 | 主窗口出现 | 设置窗口出现 | 退出 |
-/// | 在托盘 | 主窗口出现 | 设置窗口出现 | 退出 |
+/// | 在眼前 | 保持 | 只出设置窗口，主窗口原样留着 | 退出 |
+/// | 最小化 | 主窗口出现 | 只出设置窗口，主窗口收进托盘 | 退出 |
+/// | 在托盘 | 主窗口出现 | 只出设置窗口，主窗口继续藏着 | 退出 |
 ///
 /// 左键单击（`Toggle`）另算：在眼前时收起，其余两种状态都是叫出来。
 pub fn decide(ev: TrayEvent, st: WinState) -> Act {
@@ -390,9 +421,13 @@ pub fn decide(ev: TrayEvent, st: WinState) -> Act {
             WinState::Front => Act::Keep,
             _ => Act::Summon { focus: true },
         },
-        // 设置是主窗口的子视口，由主窗口那一帧驱动 —— 最小化和收进托盘
-        // 都会让主窗口停止出帧，子窗口于是永远画不出来。两种都得先叫回来。
-        TrayEvent::Settings => Act::OpenSettings,
+        // 点「设置」就只该出设置窗口，不该把词典一起搬上屏幕。
+        //
+        // 设置是主窗口的 immediate 子视口，由主窗口那一帧驱动 —— 但**只有
+        // 最小化**会真的把那一帧停掉，收进托盘的窗口 eframe 照样给帧。
+        // 所以只有最小化这一种要先把主窗口挪个地方（收进托盘，见 tuck_away），
+        // 其余两种一根手指都不用动主窗口。
+        TrayEvent::Settings => Act::OpenSettings { tuck: st == WinState::Minimized },
         TrayEvent::Quit => Act::Quit,
     }
 }
@@ -446,15 +481,57 @@ fn apply(hwnd: usize, act: Act) {
                     SetForegroundWindow(h);
                 }
             }
-            // 设置窗口要焦点，别让主窗口抢走，否则 Esc 会跑到主窗口去
-            Act::OpenSettings => {
-                ShowWindow(h, SW_RESTORE);
+            // 点设置只出设置窗口，主窗口不动。最小化那一种例外：它不出帧，
+            // 子视口就画不出来，所以先无声无息地收进托盘。
+            Act::OpenSettings { tuck } => {
+                if tuck {
+                    tuck_away(h);
+                }
             }
             Act::Dismiss => {
                 ShowWindow(h, SW_HIDE);
             }
         }
     }
+}
+
+/// 把最小化的窗口收进托盘，**过程在屏幕外完成**。
+///
+/// 为什么不能只 `ShowWindow(SW_HIDE)`：隐藏不会解掉最小化，`IsIconic` 仍然是
+/// 真。而 eframe 判断「这一帧要不要跑界面」看的正是最小化
+/// （`ViewportInfo::visible()` 由 `minimized` / `occluded` 推出来，
+/// 跟窗口可见性无关），于是主窗口一直不出帧，它的 immediate 子视口
+/// —— 设置窗口 —— 也就永远画不出来。
+///
+/// 为什么不能先 `SW_RESTORE` 再 `SW_HIDE`：那会当着用户的面闪一下词典窗口，
+/// 而这次改动的全部目的就是别闪。
+///
+/// 所以走 `WINDOWPLACEMENT`：先把「还原之后摆在哪」改到屏幕外，就地展开
+/// （`SW_SHOWNOACTIVATE`，不抢焦点），立刻隐藏，再把原来的位置写回去。
+/// 出来的状态和从「在眼前」点关闭一模一样：隐藏、非最小化、位置没动,
+/// 下次 `SW_RESTORE` 回到原地。
+///
+/// # Safety
+/// `hwnd` 必须是本进程有效的窗口句柄。
+unsafe fn tuck_away(h: Hwnd) {
+    let mut wp: WindowPlacement = std::mem::zeroed();
+    wp.length = std::mem::size_of::<WindowPlacement>() as u32;
+    if GetWindowPlacement(h, &mut wp) == 0 {
+        // 读不到就退回最朴素的一手：窗口会留在最小化状态，设置窗口开不出来，
+        // 但至少没把窗口搞坏
+        ShowWindow(h, SW_HIDE);
+        return;
+    }
+    let keep = wp.normal;
+    let (w, t) = (keep.right - keep.left, keep.bottom - keep.top);
+    // 屏幕外的一角。−32000 是 Win32 自己给最小化窗口用的坐标量级
+    wp.normal = Rect { left: -32000, top: -32000, right: -32000 + w, bottom: -32000 + t };
+    wp.show_cmd = SW_SHOWNOACTIVATE as u32;
+    SetWindowPlacement(h, &wp);
+    ShowWindow(h, SW_HIDE);
+    wp.normal = keep;
+    wp.show_cmd = SW_HIDE as u32;
+    SetWindowPlacement(h, &wp);
 }
 
 const ID_SHOW: usize = 1;
@@ -912,11 +989,12 @@ mod tests {
             (Show, Front, Keep),
             (Show, Minimized, Summon { focus: true }),
             (Show, Hidden, Summon { focus: true }),
-            // 「设置」：三种状态下都必须开出设置窗口 —— 子窗口靠主窗口那一帧
-            // 驱动，所以三种都要先把主窗口叫回来
-            (Settings, Front, OpenSettings),
-            (Settings, Minimized, OpenSettings),
-            (Settings, Hidden, OpenSettings),
+            // 「设置」：三种状态下都只开设置窗口，不把词典搬上屏幕。
+            // 只有最小化要先收进托盘 —— 最小化的窗口不出帧，
+            // 它的 immediate 子视口就画不出来。
+            (Settings, Front, OpenSettings { tuck: false }),
+            (Settings, Minimized, OpenSettings { tuck: true }),
+            (Settings, Hidden, OpenSettings { tuck: false }),
             // 「退出」：三种状态下都是真退出，不是又藏一次
             (TrayEvent::Quit, Front, Act::Quit),
             (TrayEvent::Quit, Minimized, Act::Quit),
@@ -937,10 +1015,18 @@ mod tests {
         assert_eq!(decide(Toggle, Hidden), Summon { focus: true });
     }
 
-    /// 开设置时不能连焦点一起抢走，否则 Esc 会跑到主窗口去。
+    /// 点「设置」只出设置窗口，不把词典搬上屏幕 —— 三种状态下都不是 `Summon`。
+    ///
+    /// 这条曾经是反的：为了让子视口有帧可用，三种状态都先把主窗口叫出来，
+    /// 于是「点设置」变成了「词典 + 设置一起弹」。
     #[test]
-    fn opening_settings_leaves_the_focus_to_the_child_window() {
-        assert_ne!(decide(Settings, Hidden), Summon { focus: true });
+    fn opening_settings_never_brings_the_dictionary_on_screen() {
+        for st in [Front, Minimized, Hidden] {
+            assert!(
+                matches!(decide(Settings, st), OpenSettings { .. }),
+                "{st:?} 状态下点设置不该把主窗口搬上屏幕"
+            );
+        }
     }
 
     /// 拿不到主窗口句柄时不能瞎猜成「藏起来了」——
